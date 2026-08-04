@@ -1,9 +1,0 @@
-{
-  "short_name": "Spare Parts",
-  "name": "Spare Parts Inventory",
-  "icons": [],
-  "start_url": ".",
-  "display": "standalone",
-  "theme_color": "#16222e",
-  "background_color": "#f1f4f6"
-}

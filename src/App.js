@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { db, client, DB_ID, PARTS, TXNS, configured, ID, Query } from './appwrite';
 import CameraScanner from './CameraScanner';
+import { LabelSheet, BatchLabels } from './Labels';
+import { resolveCode, isOurLabel, readPath, pushPath, partUrl } from './partCode';
 
 const NFC_AVAILABLE = typeof window !== 'undefined' && 'NDEFReader' in window;
 
@@ -16,12 +18,16 @@ export default function App() {
 
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
+  const [area, setArea] = useState('all');
+  const [shelf, setShelf] = useState('all');
 
   const [selected, setSelected] = useState(null);
   const [adding, setAdding] = useState(false);
   const [nfcOn, setNfcOn] = useState(false);
   const [camOpen, setCamOpen] = useState(false);
   const [labelFor, setLabelFor] = useState(null);
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [route, setRoute] = useState(readPath);
 
   const scanRef = useRef(null);
 
@@ -63,6 +69,25 @@ export default function App() {
 
   useEffect(() => { scanRef.current?.focus(); }, []);
 
+  // Back and forward buttons, plus our own pushPath, both fire popstate.
+  useEffect(() => {
+    const sync = () => setRoute(readPath());
+    window.addEventListener('popstate', sync);
+    return () => window.removeEventListener('popstate', sync);
+  }, []);
+
+  // Opening a part puts it in the address bar, so the URL a label
+  // encodes and the URL you can copy out of the browser are the same.
+  const openPart = useCallback((part) => {
+    setSelected(part);
+    pushPath(`/p/${encodeURIComponent(part.part_id)}`);
+  }, []);
+
+  const closePart = useCallback(() => {
+    setSelected(null);
+    pushPath('/');
+  }, []);
+
   /* ---------------- quantity ---------------- */
 
   async function adjust(part, delta) {
@@ -91,19 +116,34 @@ export default function App() {
   const handleCode = useCallback((raw, kind) => {
     const code = String(raw || '').trim();
     if (!code) return;
-    const field = kind === 'nfc' ? 'nfc_tag_id' : 'barcode';
-    const match = parts.find((p) => (p[field] || '').trim() === code);
+
+    const { part: match, via } = resolveCode(parts, code, kind);
 
     if (match) {
       setSelected(match);
+      pushPath(`/p/${encodeURIComponent(match.part_id)}`);
       setHitId(match.$id);
       setTimeout(() => setHitId(null), 1200);
-      setFlash({ tone: 'ok', text: `${match.part_name} — ${match.quantity} on hand`, code });
+      const how = via === 'label' ? 'label'
+        : via === 'part_id' ? 'part ID'
+        : via === 'ek' ? 'EK number'
+        : via === 'nfc' ? 'tag' : 'barcode';
+      setFlash({ tone: 'ok', text: `${match.part_name} — ${match.quantity} on hand (matched by ${how})`, code });
       setPending(null);
-    } else {
-      setFlash({ tone: 'miss', text: `${kind === 'nfc' ? 'Tag' : 'Barcode'} not in the database yet`, code });
-      setPending({ code, kind });
+      return;
     }
+
+    // A code shaped like one of our own labels points at a part that
+    // isn't here. Linking it to some other part would be wrong, so the
+    // offer to link is withheld — only unknown vendor codes get that.
+    if (kind !== 'nfc' && isOurLabel(code)) {
+      setFlash({ tone: 'err', text: 'That label points to a part ID that is no longer in the database', code });
+      setPending(null);
+      return;
+    }
+
+    setFlash({ tone: 'miss', text: `${kind === 'nfc' ? 'Tag' : 'Barcode'} not in the database yet`, code });
+    setPending({ code, kind });
   }, [parts]);
 
   function onScanSubmit(e) {
@@ -148,27 +188,78 @@ export default function App() {
     }
   }
 
+  // A scan from a phone lands here: the app boots at /p/<id> and the
+  // part is opened as soon as the collection finishes loading.
+  useEffect(() => {
+    if (loading || route.name !== 'part') return;
+    if (selected && selected.part_id === route.partId) return;
+    const hit = parts.find(
+      (p) => (p.part_id || '').toString().trim().toLowerCase() === route.partId.toLowerCase()
+    );
+    if (hit) {
+      setSelected(hit);
+    } else if (parts.length) {
+      setSelected(null);
+      setFlash({ tone: 'err', text: `No part with ID ${route.partId}`, code: route.partId });
+      pushPath('/', { replace: true });
+    }
+  }, [loading, parts, route, selected]);
+
   /* ---------------- derived ---------------- */
 
   const stats = useMemo(() => {
-    const low = parts.filter((p) => p.min_stock != null && p.quantity <= p.min_stock).length;
+    const low = parts.filter((p) => p.min_stock != null && p.quantity <= p.min_stock && p.quantity > 0).length;
+    const out = parts.filter((p) => p.quantity === 0).length;
     const units = parts.reduce((s, p) => s + (p.quantity || 0), 0);
     const nobar = parts.filter((p) => !p.barcode).length;
-    return { total: parts.length, low, units, nobar };
+    const shelves = new Set(parts.map((p) => (p.shelf_location || '').trim()).filter(Boolean)).size;
+    return { total: parts.length, low, out, units, nobar, shelves, healthy: parts.length - low - out };
   }, [parts]);
+
+  // Areas come from the data, so a new location becomes a filter with no code change.
+  const areas = useMemo(() => {
+    const map = new Map();
+    parts.forEach((p) => {
+      const a = (p.location || '').trim();
+      if (a) map.set(a, (map.get(a) || 0) + 1);
+    });
+    return [...map.entries()].sort((x, y) => x[0].localeCompare(y[0]));
+  }, [parts]);
+
+  // Shelves are scoped to the chosen area and sorted like you'd walk the racks
+  // (1.1, 2.1, 11.2 — not alphabetically, where 11.2 lands before 2.1).
+  const shelves = useMemo(() => {
+    const map = new Map();
+    parts.forEach((p) => {
+      if (area !== 'all' && (p.location || '').trim() !== area) return;
+      const s = (p.shelf_location || '').trim();
+      if (s) map.set(s, (map.get(s) || 0) + 1);
+    });
+    const num = (s) => s.split('.').map((n) => parseFloat(n) || 0);
+    return [...map.entries()].sort((x, y) => {
+      const [a1, a2 = 0] = num(x[0]);
+      const [b1, b2 = 0] = num(y[0]);
+      return a1 - b1 || a2 - b2 || x[0].localeCompare(y[0]);
+    });
+  }, [parts, area]);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     return parts.filter((p) => {
-      if (filter === 'low' && !(p.min_stock != null && p.quantity <= p.min_stock)) return false;
+      if (filter === 'low' && !(p.min_stock != null && p.quantity <= p.min_stock && p.quantity > 0)) return false;
       if (filter === 'zero' && p.quantity !== 0) return false;
       if (filter === 'nobarcode' && p.barcode) return false;
+      if (area !== 'all' && (p.location || '').trim() !== area) return false;
+      if (shelf !== 'all' && (p.shelf_location || '').trim() !== shelf) return false;
       if (!q) return true;
       return [p.part_id, p.part_name, p.manufacturer, p.model, p.ek_stock_number,
               p.shelf_location, p.barcode, p.location, p.comments]
         .some((v) => (v || '').toString().toLowerCase().includes(q));
     });
-  }, [parts, query, filter]);
+  }, [parts, query, filter, area, shelf]);
+
+  const narrowed = query !== '' || filter !== 'all' || area !== 'all' || shelf !== 'all';
+  function clearFilters() { setQuery(''); setFilter('all'); setArea('all'); setShelf('all'); }
 
   /* ---------------- render ---------------- */
 
@@ -183,87 +274,201 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="masthead">
-        <h1>Spare Parts</h1>
-        <span className="loc">B30 · CRITICAL EQUIPMENT ROOM</span>
-        <div className="counts">
-          <span><b>{stats.total}</b> parts</span>
-          <span><b>{stats.units}</b> units</span>
-          {stats.low > 0 && <span className="warn"><b>{stats.low}</b> low</span>}
+      {/* ── sidebar ─────────────────────────────────────────── */}
+      <aside className="sidenav">
+        <div className="brand">
+          <div className="brand-mark" aria-hidden="true" />
+          <div>
+            <div className="brand-name">Spare Parts</div>
+            <div className="brand-sub">B30 Critical Equipment</div>
+          </div>
         </div>
-      </header>
 
-      <form className="scanbar" onSubmit={onScanSubmit}>
-        <div className="field">
-          <input
-            ref={scanRef}
-            value={scan}
-            onChange={(e) => setScan(e.target.value)}
-            placeholder="Scan or type a barcode, then press Enter"
-            autoComplete="off"
-            aria-label="Barcode"
-          />
+        <div className="nav-label">Inventory</div>
+        <nav className="nav">
+          <button className={`nav-item${filter === 'all' ? ' on' : ''}`} onClick={() => setFilter('all')}>
+            <span>All parts</span><span className="n">{stats.total}</span>
+          </button>
+          <button className={`nav-item${filter === 'low' ? ' on' : ''}`} onClick={() => setFilter('low')}>
+            <span>Low stock</span><span className="n">{stats.low}</span>
+          </button>
+          <button className={`nav-item${filter === 'zero' ? ' on' : ''}`} onClick={() => setFilter('zero')}>
+            <span>Out of stock</span><span className="n">{stats.out}</span>
+          </button>
+          <button className={`nav-item${filter === 'nobarcode' ? ' on' : ''}`} onClick={() => setFilter('nobarcode')}>
+            <span>No barcode</span><span className="n">{stats.nobar}</span>
+          </button>
+        </nav>
+
+        <div className="room-card">
+          <div className="room-t">Active room</div>
+          <div className="room-v">B30 — Critical Equipment Room</div>
+          <div className="room-n">{stats.shelves} shelf positions · {stats.units} units</div>
         </div>
-        <button type="submit" className="btn btn-primary">Look up</button>
-        <button type="button" onClick={() => setCamOpen(true)} className="btn btn-cam">Scan with camera</button>
-        <button type="button" onClick={startNfc} className={`btn btn-nfc${nfcOn ? ' live' : ''}`} disabled={nfcOn}>
-          {nfcOn ? 'NFC on' : 'Read NFC tag'}
-        </button>
-      </form>
+      </aside>
 
-      {flash && (
-        <div className={`flash ${flash.tone}`}>
-          {flash.code && <code>{flash.code}</code>}
-          <span>{flash.text}</span>
-          <span className="spacer" />
-          <button onClick={() => { setFlash(null); setPending(null); }}>Dismiss</button>
-        </div>
-      )}
+      {/* ── main column ─────────────────────────────────────── */}
+      <div className="main">
+        <header className="topbar">
+          <form className="scanbar" onSubmit={onScanSubmit}>
+            <div className="field">
+              <input
+                ref={scanRef}
+                value={scan}
+                onChange={(e) => setScan(e.target.value)}
+                placeholder="Scan or type a barcode, then press Enter"
+                autoComplete="off"
+                aria-label="Barcode"
+              />
+            </div>
+            <button type="submit" className="btn btn-primary">Look up</button>
+          </form>
+          <button type="button" onClick={() => setCamOpen(true)} className="btn btn-cam">Camera</button>
+          <button type="button" onClick={startNfc} className={`btn btn-nfc${nfcOn ? ' live' : ''}`} disabled={nfcOn}>
+            {nfcOn ? 'NFC on' : 'NFC'}
+          </button>
+          <button type="button" onClick={() => setAdding(true)} className="btn btn-primary">Add part</button>
+        </header>
 
-      {pending && (
-        <div className="flash miss">
-          <span>Tap a part below to link <code>{pending.code}</code>, or</span>
-          <button onClick={() => setAdding(true)}>add it as a new part</button>
-          <span className="spacer" />
-          <button onClick={() => setPending(null)}>Cancel</button>
-        </div>
-      )}
-
-      <div className="toolbar">
-        <input type="search" value={query} onChange={(e) => setQuery(e.target.value)}
-               placeholder="Search name, ID, manufacturer, model, shelf…" />
-        <button className={`chip${filter === 'all' ? ' on' : ''}`} onClick={() => setFilter('all')}>
-          All <span className="n">{stats.total}</span>
-        </button>
-        <button className={`chip${filter === 'low' ? ' on' : ''}`} onClick={() => setFilter('low')}>
-          Low <span className="n">{stats.low}</span>
-        </button>
-        <button className={`chip${filter === 'zero' ? ' on' : ''}`} onClick={() => setFilter('zero')}>Out</button>
-        <button className={`chip${filter === 'nobarcode' ? ' on' : ''}`} onClick={() => setFilter('nobarcode')}>
-          No barcode <span className="n">{stats.nobar}</span>
-        </button>
-        <button className="btn btn-primary" onClick={() => setAdding(true)}>Add part</button>
-      </div>
-
-      <div className="list">
-        {loadError && <div className="state"><h3>Could not load parts</h3><p>{loadError}</p></div>}
-        {loading && !loadError && <div className="state"><p>Loading parts…</p></div>}
-        {!loading && !loadError && visible.length === 0 && (
-          <div className="state">
-            <h3>Nothing matches</h3>
-            <p>{parts.length === 0 ? 'Import your parts CSV in Appwrite to get started.' : 'Try a different search or filter.'}</p>
+        {flash && (
+          <div className={`flash ${flash.tone}`}>
+            {flash.code && <code>{flash.code}</code>}
+            <span>{flash.text}</span>
+            <span className="spacer" />
+            <button onClick={() => { setFlash(null); setPending(null); }}>Dismiss</button>
           </div>
         )}
-        {visible.map((p) => (
-          <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
-                   onOpen={() => (pending ? linkPending(p) : setSelected(p))} onAdjust={adjust} />
-        ))}
+
+        {pending && (
+          <div className="flash miss">
+            <span>Tap a part below to link <code>{pending.code}</code>, or</span>
+            <button onClick={() => setAdding(true)}>add it as a new part</button>
+            <span className="spacer" />
+            <button onClick={() => setPending(null)}>Cancel</button>
+          </div>
+        )}
+
+        <main className="content">
+          <h1 className="page-h1">Parts</h1>
+          <p className="page-sub">Everything stocked in B30, by rack and shelf.</p>
+
+          {/* stat cards */}
+          <div className="stats">
+            <div className="stat">
+              <div className="stat-head"><span className="stat-ic blue" />Total parts</div>
+              <div className="stat-v">{stats.total}</div>
+              <div className="stat-n">Across {stats.shelves} shelf positions</div>
+            </div>
+            <div className="stat">
+              <div className="stat-head"><span className="stat-ic amber" />At or below minimum</div>
+              <div className={`stat-v${stats.low ? ' amber' : ''}`}>{stats.low}</div>
+              <div className="stat-n">Reorder before the next PM window</div>
+            </div>
+            <div className="stat">
+              <div className="stat-head"><span className="stat-ic red" />Out of stock</div>
+              <div className={`stat-v${stats.out ? ' red' : ''}`}>{stats.out}</div>
+              <div className="stat-n">Nothing on the shelf right now</div>
+            </div>
+            <div className="stat">
+              <div className="stat-head"><span className="stat-ic green" />Healthy</div>
+              <div className="stat-v">{stats.healthy}</div>
+              <div className="stat-n">{stats.units} units counted in total</div>
+            </div>
+          </div>
+
+          {/* filter bar */}
+          <div className="filters">
+            <div className="fsearch">
+              <input type="search" value={query} onChange={(e) => setQuery(e.target.value)}
+                     placeholder="Search name, ID, manufacturer, model, shelf…" />
+            </div>
+
+            {areas.length > 1 && (
+              <div className="fgroup">
+                <span className="flabel">Area</span>
+                <button className={`chip${area === 'all' ? ' on' : ''}`}
+                        onClick={() => { setArea('all'); setShelf('all'); }}>
+                  All areas
+                </button>
+                {areas.map(([a, n]) => (
+                  <button key={a} className={`chip${area === a ? ' on' : ''}`}
+                          onClick={() => { setArea(a); setShelf('all'); }}>
+                    {a.replace(/^B30\s*-\s*/, '')} <span className="n">{n}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="fgroup">
+              <span className="flabel">Shelf</span>
+              <select className="fselect" value={shelf} onChange={(e) => setShelf(e.target.value)}>
+                <option value="all">All shelves ({shelves.length})</option>
+                {shelves.map(([s, n]) => (
+                  <option key={s} value={s}>Shelf {s} — {n} part{n === 1 ? '' : 's'}</option>
+                ))}
+              </select>
+            </div>
+
+            {narrowed && <button className="fclear" onClick={clearFilters}>Clear filters</button>}
+          </div>
+
+          {/* parts table */}
+          <div className="card">
+            <div className="card-head">
+              <span className="card-t">
+                {shelf !== 'all' ? `Shelf ${shelf}`
+                  : filter === 'low' ? 'Low stock'
+                  : filter === 'zero' ? 'Out of stock'
+                  : filter === 'nobarcode' ? 'Missing a barcode'
+                  : area !== 'all' ? area.replace(/^B30\s*-\s*/, '')
+                  : 'All parts'}
+              </span>
+              <div className="card-actions">
+                <span className="card-n">{visible.length} of {stats.total} shown</span>
+                <button className="btn btn-sm" onClick={() => setBatchOpen(true)}
+                        disabled={visible.length === 0}>
+                  Print {visible.length === stats.total ? 'all' : visible.length} label{visible.length === 1 ? '' : 's'}
+                </button>
+              </div>
+            </div>
+
+            {!loading && !loadError && visible.length > 0 && (
+              <div className="row-head">
+                <div>Part</div>
+                <div>Manufacturer</div>
+                <div>Shelf</div>
+                <div>On hand</div>
+                <div>Status</div>
+              </div>
+            )}
+
+            <div className="list">
+              {loadError && <div className="state"><h3>Could not load parts</h3><p>{loadError}</p></div>}
+              {loading && !loadError && <div className="state"><p>Loading parts…</p></div>}
+              {!loading && !loadError && visible.length === 0 && (
+                <div className="state">
+                  <h3>Nothing matches</h3>
+                  <p>{parts.length === 0
+                    ? 'Import your parts CSV in Appwrite to get started.'
+                    : 'Clear a filter or search a different part number.'}</p>
+                  {narrowed && parts.length > 0 && (
+                    <button className="btn" onClick={clearFilters}>Clear filters</button>
+                  )}
+                </div>
+              )}
+              {visible.map((p) => (
+                <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
+                         onOpen={() => (pending ? linkPending(p) : openPart(p))} onAdjust={adjust} />
+              ))}
+            </div>
+          </div>
+        </main>
       </div>
 
       {selected && (
         <Detail part={parts.find((p) => p.$id === selected.$id) || selected}
-                onClose={() => setSelected(null)} onAdjust={adjust} onSaved={loadParts}
-                onPrintLabel={(p) => { setSelected(null); setLabelFor(p); }} />
+                onClose={closePart} onAdjust={adjust} onSaved={loadParts}
+                onPrintLabel={(p) => { closePart(); setLabelFor(p); }} />
       )}
 
       {camOpen && (
@@ -272,6 +477,21 @@ export default function App() {
 
       {labelFor && (
         <LabelSheet part={labelFor} onClose={() => setLabelFor(null)} />
+      )}
+
+      {batchOpen && (
+        <BatchLabels
+          parts={visible}
+          scopeLabel={
+            shelf !== 'all' ? `shelf ${shelf}`
+              : filter === 'low' ? 'low stock'
+              : filter === 'zero' ? 'out of stock'
+              : filter === 'nobarcode' ? 'no barcode'
+              : area !== 'all' ? area
+              : 'all parts'
+          }
+          onClose={() => setBatchOpen(false)}
+        />
       )}
 
       {adding && (
@@ -287,32 +507,55 @@ export default function App() {
 /* ================= row ================= */
 
 function PartRow({ part, hit, linking, onOpen, onAdjust }) {
-  const low = part.min_stock != null && part.quantity <= part.min_stock;
   const out = part.quantity === 0;
+  const low = !out && part.min_stock != null && part.quantity <= part.min_stock;
+  const tone = out ? 'out' : low ? 'low' : 'ok';
+  const label = out ? 'Out of stock' : low ? 'Low stock' : 'In stock';
+
+  // Fill shows how far above the reorder point this part sits. With no
+  // minimum set there is nothing to measure against, so the bar is hidden.
+  const min = part.min_stock;
+  const fill = min ? Math.min(100, (part.quantity / (min * 2)) * 100) : null;
 
   return (
     <div className={`row${out ? ' zero' : low ? ' flagged' : ''}${hit ? ' hit' : ''}`}>
-      <div className="pid" onClick={onOpen} style={{ cursor: 'pointer' }}>{part.part_id}</div>
-      <div className="name" onClick={onOpen} style={{ cursor: 'pointer' }}>
+      <div className="name" onClick={onOpen} role="button" tabIndex={0}
+           onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && onOpen()}>
         <b>{part.part_name}</b>
-        <div className="sub">{part.comments || part.location || '—'}</div>
+        <div className="meta">
+          <span className="pid">{part.part_id}</span>
+          {part.ek_stock_number && <span className="ek">EK {part.ek_stock_number}</span>}
+        </div>
         <div className="tags">
           {linking && <span className="tag">TAP TO LINK</span>}
           {!part.barcode && !linking && <span className="tag warn">NO BARCODE</span>}
           {part.nfc_tag_id && <span className="tag">NFC</span>}
         </div>
       </div>
-      <div className="mfr" onClick={onOpen} style={{ cursor: 'pointer' }}>
+
+      <div className="mfr" onClick={onOpen}>
         <span>{part.manufacturer || '—'}</span>
         <span className="model">{part.model || ''}</span>
       </div>
+
       <div className="shelf-cell">
         <div className={`shelf${part.shelf_location ? '' : ' none'}`}>{part.shelf_location || '—'}</div>
       </div>
+
       <div className="qty">
         <button onClick={() => onAdjust(part, -1)} disabled={part.quantity === 0} aria-label="Remove one">−</button>
-        <span className={`n${out ? ' out' : low ? ' low' : ''}`}>{part.quantity}</span>
+        <div className="qty-read">
+          <span className={`n ${tone}`}>{part.quantity}</span>
+          <span className="min">min {min ?? '—'}</span>
+          {fill !== null && (
+            <span className="bar"><i className={tone} style={{ width: `${fill}%` }} /></span>
+          )}
+        </div>
         <button onClick={() => onAdjust(part, +1)} aria-label="Add one">+</button>
+      </div>
+
+      <div className="status-cell">
+        <span className={`pill ${tone}`}><i />{label}</span>
       </div>
     </div>
   );
@@ -383,6 +626,8 @@ function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
               <dt>EK stock no.</dt><dd className="mono">{part.ek_stock_number || '—'}</dd>
               <dt>Location</dt><dd>{part.location || '—'}</dd>
               {part.comments && (<><dt>Comments</dt><dd>{part.comments}</dd></>)}
+              <dt>Label link</dt>
+              <dd><a className="mono link" href={partUrl(part.part_id)}>{partUrl(part.part_id)}</a></dd>
             </dl>
           </div>
 
@@ -454,67 +699,6 @@ function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
       </div>
     </div>
   );
-}
-
-/* ================= QR label ================= */
-
-function LabelSheet({ part, onClose }) {
-  // The QR encodes the part_id, so scanning a printed label
-  // resolves through the same lookup as a vendor barcode.
-  const payload = part.barcode || part.part_id;
-
-  return (
-    <div className="scrim" onClick={onClose}>
-      <div className="panel label-panel" onClick={(e) => e.stopPropagation()}>
-        <div className="panel-head no-print">
-          <div>
-            <h2>QR label</h2>
-            <div className="pid">PART {part.part_id}</div>
-          </div>
-          <button className="x" onClick={onClose} aria-label="Close">×</button>
-        </div>
-
-        <div className="panel-body">
-          <div className="label-card">
-            <QRBlock text={payload} />
-            <div className="label-meta">
-              <b>{part.part_name}</b>
-              <span className="mono">{part.part_id}</span>
-              {part.shelf_location && <span className="mono">SHELF {part.shelf_location}</span>}
-              {part.manufacturer && <span>{part.manufacturer}</span>}
-            </div>
-          </div>
-
-          <p className="label-note no-print">
-            Scanning this label looks up <code>{payload}</code>.
-            {!part.barcode && ' This part has no vendor barcode, so the label uses its part ID.'}
-          </p>
-        </div>
-
-        <div className="panel-foot no-print">
-          <button className="btn" onClick={onClose}>Close</button>
-          <button className="btn btn-primary" onClick={() => window.print()}>Print</button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* Renders a QR code as an inline SVG via a tiny encoder. */
-function QRBlock({ text }) {
-  const [svg, setSvg] = useState('');
-
-  useEffect(() => {
-    let alive = true;
-    import('qrcode')
-      .then((QR) => QR.toString(text, { type: 'svg', margin: 1, width: 190 }))
-      .then((out) => { if (alive) setSvg(out); })
-      .catch(() => { if (alive) setSvg(''); });
-    return () => { alive = false; };
-  }, [text]);
-
-  if (!svg) return <div className="qr-holder">generating…</div>;
-  return <div className="qr-holder" dangerouslySetInnerHTML={{ __html: svg }} />;
 }
 
 /* ================= add part ================= */

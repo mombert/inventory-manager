@@ -1,17 +1,17 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { supabase, configured } from './supabase';
+import { db, client, DB_ID, PARTS, TXNS, configured, ID, Query } from './appwrite';
+import CameraScanner from './CameraScanner';
 
 const NFC_AVAILABLE = typeof window !== 'undefined' && 'NDEFReader' in window;
 
 export default function App() {
   const [parts, setParts] = useState([]);
-  const [equipment, setEquipment] = useState({});
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
 
   const [scan, setScan] = useState('');
-  const [flash, setFlash] = useState(null);      // {tone, text, code}
-  const [pending, setPending] = useState(null);  // {code, kind} awaiting link
+  const [flash, setFlash] = useState(null);
+  const [pending, setPending] = useState(null);
   const [hitId, setHitId] = useState(null);
 
   const [query, setQuery] = useState('');
@@ -20,41 +20,45 @@ export default function App() {
   const [selected, setSelected] = useState(null);
   const [adding, setAdding] = useState(false);
   const [nfcOn, setNfcOn] = useState(false);
+  const [camOpen, setCamOpen] = useState(false);
+  const [labelFor, setLabelFor] = useState(null);
 
   const scanRef = useRef(null);
 
   /* ---------------- data ---------------- */
 
+  // Appwrite caps a page at 100 documents, so we page through.
   const loadParts = useCallback(async () => {
-    const { data, error } = await supabase
-      .from('parts')
-      .select('*')
-      .order('part_name');
-    if (error) { setLoadError(error.message); return; }
-    setParts(data || []);
-    setLoadError(null);
+    try {
+      const all = [];
+      let cursor = null;
+      for (let guard = 0; guard < 40; guard++) {
+        const queries = [Query.limit(100), Query.orderAsc('part_name')];
+        if (cursor) queries.push(Query.cursorAfter(cursor));
+        const res = await db.listDocuments(DB_ID, PARTS, queries);
+        all.push(...res.documents);
+        if (res.documents.length < 100) break;
+        cursor = res.documents[res.documents.length - 1].$id;
+      }
+      setParts(all);
+      setLoadError(null);
+    } catch (e) {
+      setLoadError(e.message || 'Could not reach the database');
+    }
   }, []);
 
   useEffect(() => {
     if (!configured) { setLoading(false); return; }
+    (async () => { await loadParts(); setLoading(false); })();
 
-    (async () => {
-      await loadParts();
-      const { data } = await supabase
-        .from('equipment')
-        .select('equipment_id, tag, description, sub_system');
-      const map = {};
-      (data || []).forEach((e) => { map[e.equipment_id] = e; });
-      setEquipment(map);
-      setLoading(false);
-    })();
-
-    const channel = supabase
-      .channel('parts-sync')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'parts' }, loadParts)
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
+    let unsub = () => {};
+    try {
+      unsub = client.subscribe(
+        `databases.${DB_ID}.collections.${PARTS}.documents`,
+        () => loadParts()
+      );
+    } catch (e) { /* realtime optional */ }
+    return () => { try { unsub(); } catch (e) {} };
   }, [loadParts]);
 
   useEffect(() => { scanRef.current?.focus(); }, []);
@@ -65,22 +69,21 @@ export default function App() {
     const next = Math.max(0, part.quantity + delta);
     if (next === part.quantity) return;
 
-    setParts((p) => p.map((x) => (x.part_id === part.part_id ? { ...x, quantity: next } : x)));
-    setSelected((s) => (s && s.part_id === part.part_id ? { ...s, quantity: next } : s));
+    setParts((p) => p.map((x) => (x.$id === part.$id ? { ...x, quantity: next } : x)));
+    setSelected((s) => (s && s.$id === part.$id ? { ...s, quantity: next } : s));
 
-    const { error } = await supabase
-      .from('parts')
-      .update({ quantity: next })
-      .eq('part_id', part.part_id);
-
-    if (error) { setFlash({ tone: 'err', text: `Could not save: ${error.message}` }); loadParts(); return; }
-
-    await supabase.from('transactions').insert([{
-      part_id: part.part_id,
-      action: delta < 0 ? 'issue' : 'receive',
-      qty_change: delta,
-      qty_after: next,
-    }]);
+    try {
+      await db.updateDocument(DB_ID, PARTS, part.$id, { quantity: next });
+      await db.createDocument(DB_ID, TXNS, ID.unique(), {
+        part_id: part.part_id,
+        action: delta < 0 ? 'issue' : 'receive',
+        qty_change: delta,
+        qty_after: next,
+      });
+    } catch (e) {
+      setFlash({ tone: 'err', text: `Could not save: ${e.message}` });
+      loadParts();
+    }
   }
 
   /* ---------------- scanning ---------------- */
@@ -88,13 +91,12 @@ export default function App() {
   const handleCode = useCallback((raw, kind) => {
     const code = String(raw || '').trim();
     if (!code) return;
-
     const field = kind === 'nfc' ? 'nfc_tag_id' : 'barcode';
     const match = parts.find((p) => (p[field] || '').trim() === code);
 
     if (match) {
       setSelected(match);
-      setHitId(match.part_id);
+      setHitId(match.$id);
       setTimeout(() => setHitId(null), 1200);
       setFlash({ tone: 'ok', text: `${match.part_name} — ${match.quantity} on hand`, code });
       setPending(null);
@@ -128,22 +130,22 @@ export default function App() {
     }
   }
 
+  function onCameraDetect(code) {
+    setCamOpen(false);
+    handleCode(code, 'barcode');
+  }
+
   async function linkPending(part) {
     if (!pending) return;
     const field = pending.kind === 'nfc' ? 'nfc_tag_id' : 'barcode';
-
-    const { error } = await supabase
-      .from('parts')
-      .update({ [field]: pending.code })
-      .eq('part_id', part.part_id);
-
-    if (error) {
-      setFlash({ tone: 'err', text: `Could not link: ${error.message}` });
-      return;
+    try {
+      await db.updateDocument(DB_ID, PARTS, part.$id, { [field]: pending.code });
+      setFlash({ tone: 'ok', text: `Linked ${pending.code} to ${part.part_name}`, code: pending.code });
+      setPending(null);
+      loadParts();
+    } catch (e) {
+      setFlash({ tone: 'err', text: `Could not link: ${e.message}` });
     }
-    setFlash({ tone: 'ok', text: `Linked ${pending.code} to ${part.part_name}`, code: pending.code });
-    setPending(null);
-    loadParts();
   }
 
   /* ---------------- derived ---------------- */
@@ -174,7 +176,7 @@ export default function App() {
     return (
       <div className="state">
         <h3>Connect the database</h3>
-        <p>Add REACT_APP_SUPABASE_URL and REACT_APP_SUPABASE_ANON_KEY in Vercel, then redeploy.</p>
+        <p>Add the Appwrite endpoint, project ID and database ID in Vercel, then redeploy.</p>
       </div>
     );
   }
@@ -203,12 +205,8 @@ export default function App() {
           />
         </div>
         <button type="submit" className="btn btn-primary">Look up</button>
-        <button
-          type="button"
-          onClick={startNfc}
-          className={`btn btn-nfc${nfcOn ? ' live' : ''}`}
-          disabled={nfcOn}
-        >
+        <button type="button" onClick={() => setCamOpen(true)} className="btn btn-cam">Scan with camera</button>
+        <button type="button" onClick={startNfc} className={`btn btn-nfc${nfcOn ? ' live' : ''}`} disabled={nfcOn}>
           {nfcOn ? 'NFC on' : 'Read NFC tag'}
         </button>
       </form>
@@ -232,21 +230,15 @@ export default function App() {
       )}
 
       <div className="toolbar">
-        <input
-          type="search"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search name, ID, manufacturer, model, shelf…"
-        />
+        <input type="search" value={query} onChange={(e) => setQuery(e.target.value)}
+               placeholder="Search name, ID, manufacturer, model, shelf…" />
         <button className={`chip${filter === 'all' ? ' on' : ''}`} onClick={() => setFilter('all')}>
           All <span className="n">{stats.total}</span>
         </button>
         <button className={`chip${filter === 'low' ? ' on' : ''}`} onClick={() => setFilter('low')}>
           Low <span className="n">{stats.low}</span>
         </button>
-        <button className={`chip${filter === 'zero' ? ' on' : ''}`} onClick={() => setFilter('zero')}>
-          Out
-        </button>
+        <button className={`chip${filter === 'zero' ? ' on' : ''}`} onClick={() => setFilter('zero')}>Out</button>
         <button className={`chip${filter === 'nobarcode' ? ' on' : ''}`} onClick={() => setFilter('nobarcode')}>
           No barcode <span className="n">{stats.nobar}</span>
         </button>
@@ -255,46 +247,38 @@ export default function App() {
 
       <div className="list">
         {loadError && <div className="state"><h3>Could not load parts</h3><p>{loadError}</p></div>}
-
         {loading && !loadError && <div className="state"><p>Loading parts…</p></div>}
-
         {!loading && !loadError && visible.length === 0 && (
           <div className="state">
             <h3>Nothing matches</h3>
-            <p>{parts.length === 0 ? 'Import your parts CSV in Supabase to get started.' : 'Try a different search or filter.'}</p>
+            <p>{parts.length === 0 ? 'Import your parts CSV in Appwrite to get started.' : 'Try a different search or filter.'}</p>
           </div>
         )}
-
         {visible.map((p) => (
-          <PartRow
-            key={p.part_id}
-            part={p}
-            hit={hitId === p.part_id}
-            linking={Boolean(pending)}
-            onOpen={() => (pending ? linkPending(p) : setSelected(p))}
-            onAdjust={adjust}
-          />
+          <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
+                   onOpen={() => (pending ? linkPending(p) : setSelected(p))} onAdjust={adjust} />
         ))}
       </div>
 
       {selected && (
-        <Detail
-          part={parts.find((p) => p.part_id === selected.part_id) || selected}
-          equipment={equipment}
-          onClose={() => setSelected(null)}
-          onAdjust={adjust}
-          onSaved={loadParts}
-        />
+        <Detail part={parts.find((p) => p.$id === selected.$id) || selected}
+                onClose={() => setSelected(null)} onAdjust={adjust} onSaved={loadParts}
+                onPrintLabel={(p) => { setSelected(null); setLabelFor(p); }} />
+      )}
+
+      {camOpen && (
+        <CameraScanner onDetect={onCameraDetect} onClose={() => setCamOpen(false)} />
+      )}
+
+      {labelFor && (
+        <LabelSheet part={labelFor} onClose={() => setLabelFor(null)} />
       )}
 
       {adding && (
-        <AddPart
-          seedBarcode={pending?.kind === 'barcode' ? pending.code : ''}
-          seedNfc={pending?.kind === 'nfc' ? pending.code : ''}
-          parts={parts}
-          onClose={() => setAdding(false)}
-          onSaved={() => { setAdding(false); setPending(null); loadParts(); }}
-        />
+        <AddPart seedBarcode={pending?.kind === 'barcode' ? pending.code : ''}
+                 seedNfc={pending?.kind === 'nfc' ? pending.code : ''}
+                 parts={parts} onClose={() => setAdding(false)}
+                 onSaved={() => { setAdding(false); setPending(null); loadParts(); }} />
       )}
     </div>
   );
@@ -309,7 +293,6 @@ function PartRow({ part, hit, linking, onOpen, onAdjust }) {
   return (
     <div className={`row${out ? ' zero' : low ? ' flagged' : ''}${hit ? ' hit' : ''}`}>
       <div className="pid" onClick={onOpen} style={{ cursor: 'pointer' }}>{part.part_id}</div>
-
       <div className="name" onClick={onOpen} style={{ cursor: 'pointer' }}>
         <b>{part.part_name}</b>
         <div className="sub">{part.comments || part.location || '—'}</div>
@@ -319,18 +302,13 @@ function PartRow({ part, hit, linking, onOpen, onAdjust }) {
           {part.nfc_tag_id && <span className="tag">NFC</span>}
         </div>
       </div>
-
       <div className="mfr" onClick={onOpen} style={{ cursor: 'pointer' }}>
         <span>{part.manufacturer || '—'}</span>
         <span className="model">{part.model || ''}</span>
       </div>
-
       <div className="shelf-cell">
-        <div className={`shelf${part.shelf_location ? '' : ' none'}`}>
-          {part.shelf_location || '—'}
-        </div>
+        <div className={`shelf${part.shelf_location ? '' : ' none'}`}>{part.shelf_location || '—'}</div>
       </div>
-
       <div className="qty">
         <button onClick={() => onAdjust(part, -1)} disabled={part.quantity === 0} aria-label="Remove one">−</button>
         <span className={`n${out ? ' out' : low ? ' low' : ''}`}>{part.quantity}</span>
@@ -342,7 +320,7 @@ function PartRow({ part, hit, linking, onOpen, onAdjust }) {
 
 /* ================= detail panel ================= */
 
-function Detail({ part, equipment, onClose, onAdjust, onSaved }) {
+function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
   const [minStock, setMinStock] = useState(part.min_stock ?? '');
   const [barcode, setBarcode] = useState(part.barcode || '');
   const [nfc, setNfc] = useState(part.nfc_tag_id || '');
@@ -353,32 +331,28 @@ function Detail({ part, equipment, onClose, onAdjust, onSaved }) {
   const [err, setErr] = useState(null);
 
   useEffect(() => {
-    supabase
-      .from('transactions')
-      .select('*')
-      .eq('part_id', part.part_id)
-      .order('created_at', { ascending: false })
-      .limit(12)
-      .then(({ data }) => setHistory(data || []));
+    db.listDocuments(DB_ID, TXNS, [
+      Query.equal('part_id', part.part_id),
+      Query.orderDesc('$createdAt'),
+      Query.limit(12),
+    ]).then((r) => setHistory(r.documents)).catch(() => setHistory([]));
   }, [part.part_id, part.quantity]);
 
   async function save() {
     setSaving(true); setErr(null);
-    const patch = {
-      min_stock: minStock === '' ? null : Number(minStock),
-      barcode: barcode.trim() || null,
-      nfc_tag_id: nfc.trim() || null,
-      shelf_location: shelf.trim() || null,
-      equipment_id: eq.trim() || null,
-    };
-    const { error } = await supabase.from('parts').update(patch).eq('part_id', part.part_id);
-    setSaving(false);
-    if (error) { setErr(error.message); return; }
-    onSaved();
-    onClose();
+    try {
+      await db.updateDocument(DB_ID, PARTS, part.$id, {
+        min_stock: minStock === '' ? null : Number(minStock),
+        barcode: barcode.trim() || null,
+        nfc_tag_id: nfc.trim() || null,
+        shelf_location: shelf.trim() || null,
+        equipment_id: eq.trim() || null,
+      });
+      onSaved(); onClose();
+    } catch (e) {
+      setErr(e.message);
+    } finally { setSaving(false); }
   }
-
-  const linked = part.equipment_id ? equipment[part.equipment_id] : null;
 
   return (
     <div className="scrim" onClick={onClose}>
@@ -409,7 +383,6 @@ function Detail({ part, equipment, onClose, onAdjust, onSaved }) {
               <dt>EK stock no.</dt><dd className="mono">{part.ek_stock_number || '—'}</dd>
               <dt>Location</dt><dd>{part.location || '—'}</dd>
               {part.comments && (<><dt>Comments</dt><dd>{part.comments}</dd></>)}
-              {linked && (<><dt>Equipment</dt><dd className="mono">{linked.tag} · {linked.description}</dd></>)}
             </dl>
           </div>
 
@@ -447,8 +420,7 @@ function Detail({ part, equipment, onClose, onAdjust, onSaved }) {
           <div className="section">
             <h4>LINKED EQUIPMENT</h4>
             <div className="field-row">
-              <input className="mono" value={eq} onChange={(e) => setEq(e.target.value)}
-                     placeholder="EQ-1000001" />
+              <input className="mono" value={eq} onChange={(e) => setEq(e.target.value)} placeholder="EQ-1000001" />
             </div>
           </div>
 
@@ -457,8 +429,8 @@ function Detail({ part, equipment, onClose, onAdjust, onSaved }) {
               <h4>RECENT MOVEMENT</h4>
               <div className="hist">
                 {history.map((h) => (
-                  <div className="hist-row" key={h.id}>
-                    <span className="d">{new Date(h.created_at).toLocaleDateString()}</span>
+                  <div className="hist-row" key={h.$id}>
+                    <span className="d">{new Date(h.$createdAt).toLocaleDateString()}</span>
                     <span className={`c ${h.qty_change > 0 ? 'up' : 'dn'}`}>
                       {h.qty_change > 0 ? '+' : ''}{h.qty_change}
                     </span>
@@ -474,7 +446,7 @@ function Detail({ part, equipment, onClose, onAdjust, onSaved }) {
         </div>
 
         <div className="panel-foot">
-          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn" onClick={() => onPrintLabel(part)}>QR label</button>
           <button className="btn btn-primary" onClick={save} disabled={saving}>
             {saving ? 'Saving…' : 'Save changes'}
           </button>
@@ -482,6 +454,67 @@ function Detail({ part, equipment, onClose, onAdjust, onSaved }) {
       </div>
     </div>
   );
+}
+
+/* ================= QR label ================= */
+
+function LabelSheet({ part, onClose }) {
+  // The QR encodes the part_id, so scanning a printed label
+  // resolves through the same lookup as a vendor barcode.
+  const payload = part.barcode || part.part_id;
+
+  return (
+    <div className="scrim" onClick={onClose}>
+      <div className="panel label-panel" onClick={(e) => e.stopPropagation()}>
+        <div className="panel-head no-print">
+          <div>
+            <h2>QR label</h2>
+            <div className="pid">PART {part.part_id}</div>
+          </div>
+          <button className="x" onClick={onClose} aria-label="Close">×</button>
+        </div>
+
+        <div className="panel-body">
+          <div className="label-card">
+            <QRBlock text={payload} />
+            <div className="label-meta">
+              <b>{part.part_name}</b>
+              <span className="mono">{part.part_id}</span>
+              {part.shelf_location && <span className="mono">SHELF {part.shelf_location}</span>}
+              {part.manufacturer && <span>{part.manufacturer}</span>}
+            </div>
+          </div>
+
+          <p className="label-note no-print">
+            Scanning this label looks up <code>{payload}</code>.
+            {!part.barcode && ' This part has no vendor barcode, so the label uses its part ID.'}
+          </p>
+        </div>
+
+        <div className="panel-foot no-print">
+          <button className="btn" onClick={onClose}>Close</button>
+          <button className="btn btn-primary" onClick={() => window.print()}>Print</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Renders a QR code as an inline SVG via a tiny encoder. */
+function QRBlock({ text }) {
+  const [svg, setSvg] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    import('qrcode')
+      .then((QR) => QR.toString(text, { type: 'svg', margin: 1, width: 190 }))
+      .then((out) => { if (alive) setSvg(out); })
+      .catch(() => { if (alive) setSvg(''); });
+    return () => { alive = false; };
+  }, [text]);
+
+  if (!svg) return <div className="qr-holder">generating…</div>;
+  return <div className="qr-holder" dangerouslySetInnerHTML={{ __html: svg }} />;
 }
 
 /* ================= add part ================= */
@@ -495,30 +528,19 @@ function AddPart({ seedBarcode, seedNfc, parts, onClose, onSaved }) {
   const defaultLocation = parts[0]?.location || 'B30 - Critical Equipment Room';
 
   const [f, setF] = useState({
-    part_id: nextId,
-    part_name: '',
-    manufacturer: '',
-    model: '',
-    ek_stock_number: '',
-    location: defaultLocation,
-    shelf_location: '',
-    quantity: '1',
-    min_stock: '',
-    barcode: seedBarcode || '',
-    nfc_tag_id: seedNfc || '',
-    equipment_id: '',
-    comments: '',
+    part_id: nextId, part_name: '', manufacturer: '', model: '', ek_stock_number: '',
+    location: defaultLocation, shelf_location: '', quantity: '1', min_stock: '',
+    barcode: seedBarcode || '', nfc_tag_id: seedNfc || '', equipment_id: '', comments: '',
   });
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState(null);
-
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
 
   async function save() {
     if (!f.part_name.trim()) { setErr('Give the part a name.'); return; }
     if (!f.part_id.trim()) { setErr('Give the part an ID.'); return; }
-
     setSaving(true); setErr(null);
+
     const row = {
       part_id: f.part_id.trim(),
       part_name: f.part_name.trim(),
@@ -535,29 +557,23 @@ function AddPart({ seedBarcode, seedNfc, parts, onClose, onSaved }) {
       comments: f.comments.trim() || null,
     };
 
-    const { error } = await supabase.from('parts').insert([row]);
-    if (error) { setSaving(false); setErr(error.message); return; }
-
-    await supabase.from('transactions').insert([{
-      part_id: row.part_id,
-      action: 'create',
-      qty_change: row.quantity,
-      qty_after: row.quantity,
-      note: 'Added manually',
-    }]);
-
-    setSaving(false);
-    onSaved();
+    try {
+      await db.createDocument(DB_ID, PARTS, ID.unique(), row);
+      await db.createDocument(DB_ID, TXNS, ID.unique(), {
+        part_id: row.part_id, action: 'create',
+        qty_change: row.quantity, qty_after: row.quantity, note: 'Added manually',
+      });
+      onSaved();
+    } catch (e) {
+      setErr(e.message);
+    } finally { setSaving(false); }
   }
 
   return (
     <div className="scrim" onClick={onClose}>
       <div className="panel" onClick={(e) => e.stopPropagation()}>
         <div className="panel-head">
-          <div>
-            <h2>Add a part</h2>
-            <div className="pid">NEW RECORD</div>
-          </div>
+          <div><h2>Add a part</h2><div className="pid">NEW RECORD</div></div>
           <button className="x" onClick={onClose} aria-label="Close">×</button>
         </div>
 

@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { db, client, DB_ID, PARTS, TXNS, configured, ID, Query } from './appwrite';
 import CameraScanner from './CameraScanner';
 import { LabelSheet, BatchLabels } from './Labels';
-import { resolveCode, isOurLabel, readPath, pushPath, partUrl } from './partCode';
+import { resolveCode, isOurLabel } from './partCode';
 
 const NFC_AVAILABLE = typeof window !== 'undefined' && 'NDEFReader' in window;
 
@@ -11,7 +11,6 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
 
-  const [scan, setScan] = useState('');
   const [flash, setFlash] = useState(null);
   const [pending, setPending] = useState(null);
   const [hitId, setHitId] = useState(null);
@@ -27,9 +26,7 @@ export default function App() {
   const [camOpen, setCamOpen] = useState(false);
   const [labelFor, setLabelFor] = useState(null);
   const [batchOpen, setBatchOpen] = useState(false);
-  const [route, setRoute] = useState(readPath);
 
-  const scanRef = useRef(null);
 
   /* ---------------- data ---------------- */
 
@@ -67,27 +64,6 @@ export default function App() {
     return () => { try { unsub(); } catch (e) {} };
   }, [loadParts]);
 
-  useEffect(() => { scanRef.current?.focus(); }, []);
-
-  // Back and forward buttons, plus our own pushPath, both fire popstate.
-  useEffect(() => {
-    const sync = () => setRoute(readPath());
-    window.addEventListener('popstate', sync);
-    return () => window.removeEventListener('popstate', sync);
-  }, []);
-
-  // Opening a part puts it in the address bar, so the URL a label
-  // encodes and the URL you can copy out of the browser are the same.
-  const openPart = useCallback((part) => {
-    setSelected(part);
-    pushPath(`/p/${encodeURIComponent(part.part_id)}`);
-  }, []);
-
-  const closePart = useCallback(() => {
-    setSelected(null);
-    pushPath('/');
-  }, []);
-
   /* ---------------- quantity ---------------- */
 
   async function adjust(part, delta) {
@@ -121,7 +97,6 @@ export default function App() {
 
     if (match) {
       setSelected(match);
-      pushPath(`/p/${encodeURIComponent(match.part_id)}`);
       setHitId(match.$id);
       setTimeout(() => setHitId(null), 1200);
       const how = via === 'label' ? 'label'
@@ -146,16 +121,9 @@ export default function App() {
     setPending({ code, kind });
   }, [parts]);
 
-  function onScanSubmit(e) {
-    e.preventDefault();
-    handleCode(scan, 'barcode');
-    setScan('');
-    scanRef.current?.focus();
-  }
-
   async function startNfc() {
     if (!NFC_AVAILABLE) {
-      setFlash({ tone: 'err', text: 'NFC needs Chrome on Android. Use the barcode field instead.' });
+      setFlash({ tone: 'err', text: 'NFC needs Chrome on Android. Use the camera scanner instead.' });
       return;
     }
     try {
@@ -187,23 +155,6 @@ export default function App() {
       setFlash({ tone: 'err', text: `Could not link: ${e.message}` });
     }
   }
-
-  // A scan from a phone lands here: the app boots at /p/<id> and the
-  // part is opened as soon as the collection finishes loading.
-  useEffect(() => {
-    if (loading || route.name !== 'part') return;
-    if (selected && selected.part_id === route.partId) return;
-    const hit = parts.find(
-      (p) => (p.part_id || '').toString().trim().toLowerCase() === route.partId.toLowerCase()
-    );
-    if (hit) {
-      setSelected(hit);
-    } else if (parts.length) {
-      setSelected(null);
-      setFlash({ tone: 'err', text: `No part with ID ${route.partId}`, code: route.partId });
-      pushPath('/', { replace: true });
-    }
-  }, [loading, parts, route, selected]);
 
   /* ---------------- derived ---------------- */
 
@@ -310,20 +261,11 @@ export default function App() {
       {/* ── main column ─────────────────────────────────────── */}
       <div className="main">
         <header className="topbar">
-          <form className="scanbar" onSubmit={onScanSubmit}>
-            <div className="field">
-              <input
-                ref={scanRef}
-                value={scan}
-                onChange={(e) => setScan(e.target.value)}
-                placeholder="Scan or type a barcode, then press Enter"
-                autoComplete="off"
-                aria-label="Barcode"
-              />
-            </div>
-            <button type="submit" className="btn btn-primary">Look up</button>
-          </form>
-          <button type="button" onClick={() => setCamOpen(true)} className="btn btn-cam">Camera</button>
+          <div className="topbar-title">
+            <h2>B30 — Critical Equipment Room</h2>
+            <span>{stats.total} parts tracked</span>
+          </div>
+          <button type="button" onClick={() => setCamOpen(true)} className="btn btn-cam">Scan a code</button>
           <button type="button" onClick={startNfc} className={`btn btn-nfc${nfcOn ? ' live' : ''}`} disabled={nfcOn}>
             {nfcOn ? 'NFC on' : 'NFC'}
           </button>
@@ -458,7 +400,7 @@ export default function App() {
               )}
               {visible.map((p) => (
                 <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
-                         onOpen={() => (pending ? linkPending(p) : openPart(p))} onAdjust={adjust} />
+                         onOpen={() => (pending ? linkPending(p) : setSelected(p))} onAdjust={adjust} />
               ))}
             </div>
           </div>
@@ -467,8 +409,8 @@ export default function App() {
 
       {selected && (
         <Detail part={parts.find((p) => p.$id === selected.$id) || selected}
-                onClose={closePart} onAdjust={adjust} onSaved={loadParts}
-                onPrintLabel={(p) => { closePart(); setLabelFor(p); }} />
+                onClose={() => setSelected(null)} onAdjust={adjust} onSaved={loadParts}
+                onPrintLabel={(p) => { setSelected(null); setLabelFor(p); }} />
       )}
 
       {camOpen && (
@@ -626,8 +568,6 @@ function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
               <dt>EK stock no.</dt><dd className="mono">{part.ek_stock_number || '—'}</dd>
               <dt>Location</dt><dd>{part.location || '—'}</dd>
               {part.comments && (<><dt>Comments</dt><dd>{part.comments}</dd></>)}
-              <dt>Label link</dt>
-              <dd><a className="mono link" href={partUrl(part.part_id)}>{partUrl(part.part_id)}</a></dd>
             </dl>
           </div>
 

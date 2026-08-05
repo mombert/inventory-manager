@@ -13,38 +13,26 @@
        straight to the part
    ============================================================ */
 
-/* ---------- where labels point ----------
+/* ---------- what labels encode ----------
 
-   Labels are generated in the browser, so window.location.origin is
-   almost always right. The override exists for the case that bites:
-   printing a batch from localhost during setup would otherwise bake
-   http://localhost:3000 into 173 labels.                            */
+   Labels encode the bare part ID and nothing else. A phone camera
+   scanning one sees the characters "3312" with no link to follow and
+   no way to reach the database — which is the point. The tablet's own
+   scanner resolves it, because resolveCode matches part_id directly.
 
-const CONFIGURED_BASE = (process.env.REACT_APP_PUBLIC_URL || '').trim();
+   A side benefit: the payload no longer depends on the deployed host,
+   so labels are identical whoever prints them and cannot go stale if
+   the address ever changes.                                          */
 
-export function publicBase() {
-  const base = CONFIGURED_BASE || (typeof window !== 'undefined' ? window.location.origin : '');
-  return base.replace(/\/+$/, '');
-}
-
-export function partUrl(partId) {
-  return `${publicBase()}/p/${encodeURIComponent(String(partId).trim())}`;
-}
-
-/* True when labels would be printed pointing at a machine only this
-   computer can reach. The label screen warns rather than silently
-   producing 173 dead codes. */
-export function baseIsLocal() {
-  const base = publicBase();
-  return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$/i.test(base) || base === '';
+export function labelPayload(partId) {
+  return String(partId).trim();
 }
 
 /* ---------- reading codes ---------- */
 
-/* Pulls the part id out of anything shaped like one of our labels:
-   a full URL, a bare path, or a path with a query string. Returns
-   null for codes that aren't ours, which is how the caller knows a
-   vendor barcode is safe to link to a part. */
+/* Labels no longer encode URLs, but any printed under the previous
+   scheme are still on the shelves. This keeps reading them, so old and
+   new labels both resolve and nothing has to be reprinted. */
 export function partIdFromUrl(raw) {
   const s = String(raw || '').trim();
   if (!s) return null;
@@ -96,22 +84,4 @@ export function resolveCode(parts, raw, kind) {
   if (hit) return { part: hit, via: 'ek' };
 
   return { part: null, via: null };
-}
-
-/* ---------- routing ----------
-
-   Two routes, so a router library would be more machinery than the
-   problem needs:  /  and  /p/:part_id                                */
-
-export function readPath() {
-  if (typeof window === 'undefined') return { name: 'list', partId: null };
-  const id = partIdFromUrl(window.location.pathname);
-  return id ? { name: 'part', partId: id } : { name: 'list', partId: null };
-}
-
-export function pushPath(path, { replace = false } = {}) {
-  if (typeof window === 'undefined') return;
-  if (window.location.pathname === path) return;
-  window.history[replace ? 'replaceState' : 'pushState']({}, '', path);
-  window.dispatchEvent(new PopStateEvent('popstate'));
 }

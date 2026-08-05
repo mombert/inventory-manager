@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import QRCode from 'qrcode';
-import { partUrl, publicBase, baseIsLocal } from './partCode';
+import { labelPayload } from './partCode';
 
 /* Error correction M recovers ~15% of a damaged symbol. On a shelf
    label that survives grease and a scuffed corner, and it keeps the
@@ -36,7 +36,7 @@ function Label({ part, qr }) {
     <div className="label-card">
       {qr
         ? <div className="qr-holder" dangerouslySetInnerHTML={{ __html: qr }} />
-        : <QRBlock text={partUrl(part.part_id)} />}
+        : <QRBlock text={labelPayload(part.part_id)} />}
       <div className="label-meta">
         <b>{part.part_name}</b>
         <span className="mono big">{part.part_id}</span>
@@ -49,22 +49,9 @@ function Label({ part, qr }) {
   );
 }
 
-function LocalWarning() {
-  if (!baseIsLocal()) return null;
-  return (
-    <div className="err-box no-print">
-      These labels would point at <code>{publicBase() || 'an unknown host'}</code>, which only this
-      computer can reach. Set <code>REACT_APP_PUBLIC_URL</code> to the deployed address and reload
-      before printing, or the codes will be dead on the shelf.
-    </div>
-  );
-}
-
 /* ================= single label ================= */
 
 export function LabelSheet({ part, onClose }) {
-  const url = partUrl(part.part_id);
-
   return (
     <div className="scrim" onClick={onClose}>
       <div className="panel" onClick={(e) => e.stopPropagation()}>
@@ -77,7 +64,6 @@ export function LabelSheet({ part, onClose }) {
         </div>
 
         <div className="panel-body">
-          <LocalWarning />
 
           <div className="print-area">
             <div className="label-grid one">
@@ -86,8 +72,8 @@ export function LabelSheet({ part, onClose }) {
           </div>
 
           <p className="label-note no-print">
-            Scanning this label opens <code>{url}</code> — on the tablet it jumps
-            straight to this part, and on a phone camera it shows as a tappable link.
+            This label encodes <code>{part.part_id}</code> and nothing else. The tablet's
+            scanner opens the part; a phone camera shows only the number.
           </p>
         </div>
 
@@ -125,7 +111,7 @@ export function BatchLabels({ parts, scopeLabel, onClose }) {
         const CHUNK = 12;
         for (let i = 0; i < targets.length; i += CHUNK) {
           const slice = targets.slice(i, i + CHUNK);
-          const svgs = await Promise.all(slice.map((p) => renderQr(partUrl(p.part_id))));
+          const svgs = await Promise.all(slice.map((p) => renderQr(labelPayload(p.part_id))));
           if (!alive) return;
           slice.forEach((p, j) => { out[p.$id || p.part_id] = svgs[j]; });
           setDone(Math.min(i + CHUNK, targets.length));
@@ -154,7 +140,6 @@ export function BatchLabels({ parts, scopeLabel, onClose }) {
         </div>
 
         <div className="panel-body">
-          <LocalWarning />
           {err && <div className="err-box no-print">{err}</div>}
           {skipped > 0 && (
             <div className="err-box no-print">

@@ -143,35 +143,13 @@ button { cursor: pointer; background: none; border: none; }
   flex-shrink: 0;
 }
 
-/* the scan field is the signature element — it holds focus for the gun */
-.scanbar { display: flex; gap: 10px; flex: 1; min-width: 300px; }
-.scanbar .field { position: relative; flex: 1; min-width: 0; }
-.scanbar .field::before {
-  content: "SCAN";
-  position: absolute;
-  left: 12px; top: 50%;
-  transform: translateY(-50%);
-  font-size: 10px; font-weight: 700;
-  letter-spacing: 0.1em;
-  color: var(--blue);
-  background: var(--blue-wash);
-  padding: 4px 7px;
-  border-radius: 5px;
-  pointer-events: none;
+.topbar-title { flex: 1; min-width: 0; }
+.topbar-title h2 {
+  font-family: var(--display);
+  font-size: 15.5px; font-weight: 600;
+  letter-spacing: -0.2px; line-height: 1.25;
 }
-.scanbar input {
-  width: 100%;
-  padding: 12px 14px 12px 66px;
-  font-family: var(--mono);
-  font-size: 15px;
-  background: var(--canvas);
-  border: 1px solid var(--rule-strong);
-  border-radius: var(--r-md);
-  outline: none;
-  transition: border-color 0.14s, box-shadow 0.14s, background 0.14s;
-}
-.scanbar input::placeholder { font-family: var(--sans); color: var(--ink-faint); }
-.scanbar input:focus { border-color: var(--blue); background: #fff; box-shadow: var(--ring); }
+.topbar-title span { font-size: 12px; color: var(--ink-faint); }
 
 /* ============ buttons ============ */
 .btn {
@@ -671,8 +649,6 @@ button { cursor: pointer; background: none; border: none; }
   .qty .bar { max-width: 70px; }
   .btn { padding: 14px 17px; }
   .chip { padding: 9px 15px; font-size: 13px; }
-  .scanbar { min-width: 100%; }
-  .scanbar input { font-size: 16px; padding-top: 15px; padding-bottom: 15px; }
   .grid2 { grid-template-columns: 1fr; }
   .kv { grid-template-columns: 108px 1fr; }
   .fclear { margin-left: 0; }
@@ -760,14 +736,12 @@ button { cursor: pointer; background: none; border: none; }
 .label-meta .dim { color: var(--ink-faint); }
 
 .label-note { font-size: 13px; color: var(--ink-soft); }
-.label-note code, .kv .link {
+.label-note code {
   font-family: var(--mono); font-weight: 500;
   background: var(--blue-wash); color: var(--blue-dark);
   padding: 2px 6px; border-radius: 5px;
   word-break: break-all;
 }
-.kv .link { text-decoration: none; font-size: 11.5px; }
-.kv .link:hover { text-decoration: underline; }
 
 /* ---- printing ----
    Avery 5163: 4in x 2in, two across, five down, on letter.

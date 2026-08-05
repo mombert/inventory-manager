@@ -51,10 +51,14 @@ export function isOurLabel(raw) {
 
 /* Resolves a scanned code against the loaded parts.
 
-   Order matters. A label URL is unambiguous, so it wins outright and
-   never falls through to a fuzzier match. After that we try the
-   vendor barcode, then the part id, then the EK stock number — each
-   an exact match, so a code can only ever land on one part.
+   Order matters. A legacy label URL is unambiguous, so it wins outright
+   and never falls through to a fuzzier match. After that we try the part
+   id — which is what current labels encode — then the EK stock number.
+   Both are exact matches, so a code can only ever land on one part.
+
+   Vendor barcodes are deliberately not consulted. The scanner reads our
+   own labels only, and matching against a field nothing can populate
+   would just be a path that never fires.
 
    Returns { part, via } so the caller can say how it matched.        */
 export function resolveCode(parts, raw, kind) {
@@ -74,10 +78,7 @@ export function resolveCode(parts, raw, kind) {
     return { part: hit || null, via: 'label' };
   }
 
-  let hit = parts.find((p) => eq(p.barcode) === code);
-  if (hit) return { part: hit, via: 'barcode' };
-
-  hit = parts.find((p) => eq(p.part_id) === code);
+  let hit = parts.find((p) => eq(p.part_id) === code);
   if (hit) return { part: hit, via: 'part_id' };
 
   hit = parts.find((p) => eq(p.ek_stock_number) === code);

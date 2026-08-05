@@ -1,10 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Html5Qrcode } from 'html5-qrcode';
+import { Html5Qrcode, Html5QrcodeSupportedFormats } from 'html5-qrcode';
 
 const REGION_ID = 'camera-scan-region';
 
+/* Restricting the decoder to QR is not only a policy choice — with one
+   format to try per frame it locks on faster, and a barcode drifting
+   through the frame can no longer produce a code the app will only
+   reject a moment later. */
+const QR_ONLY = [Html5QrcodeSupportedFormats.QR_CODE];
+
 /**
- * Full-screen camera scanner for QR codes and 1D barcodes.
+ * Full-screen camera scanner for the QR labels printed by this app.
  * Calls onDetect(code) once, then closes.
  */
 export default function CameraScanner({ onDetect, onClose }) {
@@ -27,8 +33,9 @@ export default function CameraScanner({ onDetect, onClose }) {
           camId ? { deviceId: { exact: camId } } : { facingMode: 'environment' },
           {
             fps: 12,
-            qrbox: { width: 260, height: 180 },
+            qrbox: { width: 240, height: 240 },
             aspectRatio: 1.4,
+            formatsToSupport: QR_ONLY,
           },
           (decoded) => {
             if (firedRef.current) return;
@@ -90,7 +97,7 @@ export default function CameraScanner({ onDetect, onClose }) {
     try {
       await scanner.start(
         { deviceId: { exact: next.id } },
-        { fps: 12, qrbox: { width: 260, height: 180 }, aspectRatio: 1.4 },
+        { fps: 12, qrbox: { width: 240, height: 240 }, aspectRatio: 1.4, formatsToSupport: QR_ONLY },
         (decoded) => {
           if (firedRef.current) return;
           firedRef.current = true;
@@ -109,15 +116,15 @@ export default function CameraScanner({ onDetect, onClose }) {
       <div className="cam-panel" onClick={(e) => e.stopPropagation()}>
         <div className="cam-head">
           <div>
-            <h2>Scan a code</h2>
-            <div className="cam-sub">QR codes and barcodes</div>
+            <h2>Scan a label</h2>
+            <div className="cam-sub">QR labels printed from this app</div>
           </div>
           <button className="x" onClick={onClose} aria-label="Close scanner">×</button>
         </div>
 
         <div className="cam-stage">
           <div id={REGION_ID} className="cam-region" />
-          {!error && <div className="cam-hint">Hold the code inside the frame</div>}
+          {!error && <div className="cam-hint">Hold the QR label inside the frame</div>}
           {error && <div className="err-box cam-err">{error}</div>}
         </div>
 

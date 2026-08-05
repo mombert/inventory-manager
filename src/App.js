@@ -3,8 +3,14 @@ import { db, client, DB_ID, PARTS, TXNS, configured, ID, Query } from './appwrit
 import CameraScanner from './CameraScanner';
 import { LabelSheet, BatchLabels } from './Labels';
 import { resolveCode, isOurLabel } from './partCode';
+import InvoicePanel from './InvoicePanel';
 
 const NFC_AVAILABLE = typeof window !== 'undefined' && 'NDEFReader' in window;
+
+// Parts with no manufacturer recorded collect under one heading rather than
+// vanishing from the grouped view — the gap is itself worth being able to see.
+const UNSPECIFIED = 'Unspecified';
+const mfrOf = (p) => (p.manufacturer || '').trim() || UNSPECIFIED;
 
 export default function App() {
   const [parts, setParts] = useState([]);
@@ -17,6 +23,8 @@ export default function App() {
 
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
+  const [mfr, setMfr] = useState('all');
+  const [groupMfr, setGroupMfr] = useState(false);
   const [area, setArea] = useState('all');
   const [shelf, setShelf] = useState('all');
 
@@ -99,25 +107,35 @@ export default function App() {
       setSelected(match);
       setHitId(match.$id);
       setTimeout(() => setHitId(null), 1200);
-      const how = via === 'label' ? 'label'
+      const how = via === 'label' ? 'QR label'
         : via === 'part_id' ? 'part ID'
         : via === 'ek' ? 'EK number'
-        : via === 'nfc' ? 'tag' : 'barcode';
+        : 'tag';
       setFlash({ tone: 'ok', text: `${match.part_name} — ${match.quantity} on hand (matched by ${how})`, code });
       setPending(null);
       return;
     }
 
-    // A code shaped like one of our own labels points at a part that
-    // isn't here. Linking it to some other part would be wrong, so the
-    // offer to link is withheld — only unknown vendor codes get that.
-    if (kind !== 'nfc' && isOurLabel(code)) {
-      setFlash({ tone: 'err', text: 'That label points to a part ID that is no longer in the database', code });
+    // The camera resolves our own QR labels and nothing else, so a scan
+    // that misses is a dead label rather than something to assign. Two
+    // different failures, and the difference is worth telling someone:
+    // a numeric code is a label whose part is gone, anything else was
+    // never one of ours.
+    if (kind !== 'nfc') {
+      const ours = isOurLabel(code) || /^[A-Za-z0-9-]{1,16}$/.test(code);
+      setFlash({
+        tone: 'err',
+        text: ours
+          ? 'That label points at a part ID that is not in the database'
+          : 'Not a parts label — the scanner reads QR labels printed from this app',
+        code,
+      });
       setPending(null);
       return;
     }
 
-    setFlash({ tone: 'miss', text: `${kind === 'nfc' ? 'Tag' : 'Barcode'} not in the database yet`, code });
+    // NFC tags stay assignable: hold an unknown tag, then tap a part.
+    setFlash({ tone: 'miss', text: 'Tag not in the database yet', code });
     setPending({ code, kind });
   }, [parts]);
 
@@ -140,15 +158,14 @@ export default function App() {
 
   function onCameraDetect(code) {
     setCamOpen(false);
-    handleCode(code, 'barcode');
+    handleCode(code, 'scan');
   }
 
   async function linkPending(part) {
     if (!pending) return;
-    const field = pending.kind === 'nfc' ? 'nfc_tag_id' : 'barcode';
     try {
-      await db.updateDocument(DB_ID, PARTS, part.$id, { [field]: pending.code });
-      setFlash({ tone: 'ok', text: `Linked ${pending.code} to ${part.part_name}`, code: pending.code });
+      await db.updateDocument(DB_ID, PARTS, part.$id, { nfc_tag_id: pending.code });
+      setFlash({ tone: 'ok', text: `Linked tag to ${part.part_name}`, code: pending.code });
       setPending(null);
       loadParts();
     } catch (e) {
@@ -162,9 +179,8 @@ export default function App() {
     const low = parts.filter((p) => p.min_stock != null && p.quantity <= p.min_stock && p.quantity > 0).length;
     const out = parts.filter((p) => p.quantity === 0).length;
     const units = parts.reduce((s, p) => s + (p.quantity || 0), 0);
-    const nobar = parts.filter((p) => !p.barcode).length;
     const shelves = new Set(parts.map((p) => (p.shelf_location || '').trim()).filter(Boolean)).size;
-    return { total: parts.length, low, out, units, nobar, shelves, healthy: parts.length - low - out };
+    return { total: parts.length, low, out, units, shelves, healthy: parts.length - low - out };
   }, [parts]);
 
   // Areas come from the data, so a new location becomes a filter with no code change.
@@ -194,23 +210,52 @@ export default function App() {
     });
   }, [parts, area]);
 
+  // Manufacturers ordered by how many parts each supplies, so the vendors
+  // you actually deal with sit at the top of a 170-part dropdown.
+  const manufacturers = useMemo(() => {
+    const map = new Map();
+    parts.forEach((p) => { const m = mfrOf(p); map.set(m, (map.get(m) || 0) + 1); });
+    return [...map.entries()].sort((x, y) => {
+      if (x[0] === UNSPECIFIED) return 1;
+      if (y[0] === UNSPECIFIED) return -1;
+      return y[1] - x[1] || x[0].localeCompare(y[0]);
+    });
+  }, [parts]);
+
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     return parts.filter((p) => {
       if (filter === 'low' && !(p.min_stock != null && p.quantity <= p.min_stock && p.quantity > 0)) return false;
       if (filter === 'zero' && p.quantity !== 0) return false;
-      if (filter === 'nobarcode' && p.barcode) return false;
+      if (mfr !== 'all' && mfrOf(p) !== mfr) return false;
       if (area !== 'all' && (p.location || '').trim() !== area) return false;
       if (shelf !== 'all' && (p.shelf_location || '').trim() !== shelf) return false;
       if (!q) return true;
       return [p.part_id, p.part_name, p.manufacturer, p.model, p.ek_stock_number,
-              p.shelf_location, p.barcode, p.location, p.comments]
+              p.shelf_location, p.location, p.comments]
         .some((v) => (v || '').toString().toLowerCase().includes(q));
     });
-  }, [parts, query, filter, area, shelf]);
+  }, [parts, query, filter, mfr, area, shelf]);
 
-  const narrowed = query !== '' || filter !== 'all' || area !== 'all' || shelf !== 'all';
-  function clearFilters() { setQuery(''); setFilter('all'); setArea('all'); setShelf('all'); }
+  // Grouping runs on the filtered set, so it reorganises what you are
+  // already looking at instead of quietly widening it.
+  const grouped = useMemo(() => {
+    if (!groupMfr) return null;
+    const map = new Map();
+    visible.forEach((p) => {
+      const m = mfrOf(p);
+      if (!map.has(m)) map.set(m, []);
+      map.get(m).push(p);
+    });
+    return [...map.entries()].sort((x, y) => {
+      if (x[0] === UNSPECIFIED) return 1;
+      if (y[0] === UNSPECIFIED) return -1;
+      return x[0].localeCompare(y[0]);
+    });
+  }, [visible, groupMfr]);
+
+  const narrowed = query !== '' || filter !== 'all' || mfr !== 'all' || area !== 'all' || shelf !== 'all';
+  function clearFilters() { setQuery(''); setFilter('all'); setMfr('all'); setArea('all'); setShelf('all'); }
 
   /* ---------------- render ---------------- */
 
@@ -246,9 +291,6 @@ export default function App() {
           <button className={`nav-item${filter === 'zero' ? ' on' : ''}`} onClick={() => setFilter('zero')}>
             <span>Out of stock</span><span className="n">{stats.out}</span>
           </button>
-          <button className={`nav-item${filter === 'nobarcode' ? ' on' : ''}`} onClick={() => setFilter('nobarcode')}>
-            <span>No barcode</span><span className="n">{stats.nobar}</span>
-          </button>
         </nav>
 
         <div className="room-card">
@@ -265,7 +307,7 @@ export default function App() {
             <h2>B30 — Critical Equipment Room</h2>
             <span>{stats.total} parts tracked</span>
           </div>
-          <button type="button" onClick={() => setCamOpen(true)} className="btn btn-cam">Scan a code</button>
+          <button type="button" onClick={() => setCamOpen(true)} className="btn btn-cam">Scan a label</button>
           <button type="button" onClick={startNfc} className={`btn btn-nfc${nfcOn ? ' live' : ''}`} disabled={nfcOn}>
             {nfcOn ? 'NFC on' : 'NFC'}
           </button>
@@ -283,7 +325,7 @@ export default function App() {
 
         {pending && (
           <div className="flash miss">
-            <span>Tap a part below to link <code>{pending.code}</code>, or</span>
+            <span>Tap a part below to link tag <code>{pending.code}</code>, or</span>
             <button onClick={() => setAdding(true)}>add it as a new part</button>
             <span className="spacer" />
             <button onClick={() => setPending(null)}>Cancel</button>
@@ -351,6 +393,21 @@ export default function App() {
               </select>
             </div>
 
+            <div className="fgroup">
+              <span className="flabel">Manufacturer</span>
+              <select className="fselect" value={mfr} onChange={(e) => setMfr(e.target.value)}>
+                <option value="all">All manufacturers ({manufacturers.length})</option>
+                {manufacturers.map(([m, c]) => (
+                  <option key={m} value={m}>{m} — {c} part{c === 1 ? '' : 's'}</option>
+                ))}
+              </select>
+              <button className={`chip${groupMfr ? ' on' : ''}`}
+                      onClick={() => setGroupMfr((g) => !g)}
+                      title="Break the list into a section per manufacturer">
+                Group by maker
+              </button>
+            </div>
+
             {narrowed && <button className="fclear" onClick={clearFilters}>Clear filters</button>}
           </div>
 
@@ -361,7 +418,7 @@ export default function App() {
                 {shelf !== 'all' ? `Shelf ${shelf}`
                   : filter === 'low' ? 'Low stock'
                   : filter === 'zero' ? 'Out of stock'
-                  : filter === 'nobarcode' ? 'Missing a barcode'
+                  : mfr !== 'all' ? mfr
                   : area !== 'all' ? area.replace(/^B30\s*-\s*/, '')
                   : 'All parts'}
               </span>
@@ -398,10 +455,23 @@ export default function App() {
                   )}
                 </div>
               )}
-              {visible.map((p) => (
-                <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
-                         onOpen={() => (pending ? linkPending(p) : setSelected(p))} onAdjust={adjust} />
-              ))}
+              {grouped
+                ? grouped.map(([name, rows]) => (
+                    <div className="mgroup" key={name}>
+                      <div className="mgroup-head">
+                        <span className={name === UNSPECIFIED ? 'faint' : ''}>{name}</span>
+                        <span className="n">{rows.length}</span>
+                      </div>
+                      {rows.map((p) => (
+                        <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
+                                 onOpen={() => (pending ? linkPending(p) : setSelected(p))} onAdjust={adjust} />
+                      ))}
+                    </div>
+                  ))
+                : visible.map((p) => (
+                    <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
+                             onOpen={() => (pending ? linkPending(p) : setSelected(p))} onAdjust={adjust} />
+                  ))}
             </div>
           </div>
         </main>
@@ -428,7 +498,7 @@ export default function App() {
             shelf !== 'all' ? `shelf ${shelf}`
               : filter === 'low' ? 'low stock'
               : filter === 'zero' ? 'out of stock'
-              : filter === 'nobarcode' ? 'no barcode'
+              : mfr !== 'all' ? mfr
               : area !== 'all' ? area
               : 'all parts'
           }
@@ -437,8 +507,7 @@ export default function App() {
       )}
 
       {adding && (
-        <AddPart seedBarcode={pending?.kind === 'barcode' ? pending.code : ''}
-                 seedNfc={pending?.kind === 'nfc' ? pending.code : ''}
+        <AddPart seedNfc={pending?.kind === 'nfc' ? pending.code : ''}
                  parts={parts} onClose={() => setAdding(false)}
                  onSaved={() => { setAdding(false); setPending(null); loadParts(); }} />
       )}
@@ -470,7 +539,6 @@ function PartRow({ part, hit, linking, onOpen, onAdjust }) {
         </div>
         <div className="tags">
           {linking && <span className="tag">TAP TO LINK</span>}
-          {!part.barcode && !linking && <span className="tag warn">NO BARCODE</span>}
           {part.nfc_tag_id && <span className="tag">NFC</span>}
         </div>
       </div>
@@ -507,7 +575,6 @@ function PartRow({ part, hit, linking, onOpen, onAdjust }) {
 
 function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
   const [minStock, setMinStock] = useState(part.min_stock ?? '');
-  const [barcode, setBarcode] = useState(part.barcode || '');
   const [nfc, setNfc] = useState(part.nfc_tag_id || '');
   const [shelf, setShelf] = useState(part.shelf_location || '');
   const [eq, setEq] = useState(part.equipment_id || '');
@@ -528,7 +595,6 @@ function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
     try {
       await db.updateDocument(DB_ID, PARTS, part.$id, {
         min_stock: minStock === '' ? null : Number(minStock),
-        barcode: barcode.trim() || null,
         nfc_tag_id: nfc.trim() || null,
         shelf_location: shelf.trim() || null,
         equipment_id: eq.trim() || null,
@@ -587,20 +653,14 @@ function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
           </div>
 
           <div className="section">
-            <h4>SCAN CODES</h4>
-            <div className="assign">
-              <div className="field-row">
-                <label htmlFor="bc">Barcode</label>
-                <input id="bc" className="mono" value={barcode} onChange={(e) => setBarcode(e.target.value)}
-                       placeholder="Scan into this field to assign" />
-              </div>
-              <div className="field-row">
-                <label htmlFor="nf">NFC tag ID</label>
-                <input id="nf" className="mono" value={nfc} onChange={(e) => setNfc(e.target.value)}
-                       placeholder="Tap a tag from the main screen to assign" />
-              </div>
+            <h4>NFC TAG</h4>
+            <div className="field-row">
+              <input id="nf" className="mono" value={nfc} onChange={(e) => setNfc(e.target.value)}
+                     placeholder="Tap a tag from the main screen to assign" />
             </div>
           </div>
+
+          <InvoicePanel partId={part.part_id} />
 
           <div className="section">
             <h4>LINKED EQUIPMENT</h4>
@@ -643,7 +703,7 @@ function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
 
 /* ================= add part ================= */
 
-function AddPart({ seedBarcode, seedNfc, parts, onClose, onSaved }) {
+function AddPart({ seedNfc, parts, onClose, onSaved }) {
   const nextId = useMemo(() => {
     const nums = parts.map((p) => parseInt(p.part_id, 10)).filter((n) => !isNaN(n));
     return nums.length ? String(Math.max(...nums) + 1) : '1001';
@@ -654,7 +714,7 @@ function AddPart({ seedBarcode, seedNfc, parts, onClose, onSaved }) {
   const [f, setF] = useState({
     part_id: nextId, part_name: '', manufacturer: '', model: '', ek_stock_number: '',
     location: defaultLocation, shelf_location: '', quantity: '1', min_stock: '',
-    barcode: seedBarcode || '', nfc_tag_id: seedNfc || '', equipment_id: '', comments: '',
+    nfc_tag_id: seedNfc || '', equipment_id: '', comments: '',
   });
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState(null);
@@ -675,7 +735,6 @@ function AddPart({ seedBarcode, seedNfc, parts, onClose, onSaved }) {
       shelf_location: f.shelf_location.trim() || null,
       quantity: Number(f.quantity) || 0,
       min_stock: f.min_stock === '' ? null : Number(f.min_stock),
-      barcode: f.barcode.trim() || null,
       nfc_tag_id: f.nfc_tag_id.trim() || null,
       equipment_id: f.equipment_id.trim() || null,
       comments: f.comments.trim() || null,
@@ -747,24 +806,18 @@ function AddPart({ seedBarcode, seedNfc, parts, onClose, onSaved }) {
 
           <div className="grid2">
             <div className="field-row">
-              <label htmlFor="a-bc">Barcode</label>
-              <input id="a-bc" className="mono" value={f.barcode} onChange={set('barcode')} placeholder="optional" />
-            </div>
-            <div className="field-row">
               <label htmlFor="a-nfc">NFC tag ID</label>
               <input id="a-nfc" className="mono" value={f.nfc_tag_id} onChange={set('nfc_tag_id')} placeholder="optional" />
             </div>
-          </div>
-
-          <div className="grid2">
             <div className="field-row">
               <label htmlFor="a-ek">EK stock number</label>
               <input id="a-ek" className="mono" value={f.ek_stock_number} onChange={set('ek_stock_number')} placeholder="optional" />
             </div>
-            <div className="field-row">
-              <label htmlFor="a-eq">Equipment ID</label>
-              <input id="a-eq" className="mono" value={f.equipment_id} onChange={set('equipment_id')} placeholder="EQ-1000001" />
-            </div>
+          </div>
+
+          <div className="field-row">
+            <label htmlFor="a-eq">Equipment ID</label>
+            <input id="a-eq" className="mono" value={f.equipment_id} onChange={set('equipment_id')} placeholder="EQ-1000001" />
           </div>
 
           <div className="field-row">

@@ -186,6 +186,7 @@ tbody tr:hover{background:var(--surface-2)}
   font-size:22px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.12s}
 .oh-btn:hover{background:var(--raised);border-color:var(--accent)}
 .oh-num{font-family:var(--font-display);font-weight:700;font-size:30px;min-width:56px;text-align:center}
+.oh-unit{color:var(--ink-faint);font-size:13px;font-weight:500}
 .drow{display:flex;justify-content:space-between;gap:16px;padding:11px 0;border-bottom:1px solid var(--rule)}
 .drow .k{color:var(--ink-soft);font-size:13.5px}
 .drow .v{color:var(--ink);font-size:13.5px;text-align:right;font-weight:500}

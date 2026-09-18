@@ -114,21 +114,6 @@ export default function App() {
     return () => { try { unsub && unsub(); } catch (e) {} };
   }, []);
 
-  /* single-part quick adjust (detail +/-) — logged without a name */
-  const adjust = useCallback(async (part, delta) => {
-    const next = Math.max(0, (part.quantity || 0) + delta);
-    if (next === part.quantity) return;
-    setParts((p) => p.map((x) => (x.$id === part.$id ? { ...x, quantity: next } : x)));
-    setSelected((s) => (s && s.$id === part.$id ? { ...s, quantity: next } : s));
-    try {
-      await db.updateDocument(DB_ID, PARTS, part.$id, { quantity: next });
-      await db.createDocument(DB_ID, TXNS, ID.unique(), {
-        part_id: part.part_id, action: delta < 0 ? 'issue' : 'receive',
-        qty_change: delta, qty_after: next, note: 'Quick adjust',
-      });
-    } catch (e) { setErr(e.message); }
-  }, []);
-
   /* ---------- derived ---------- */
   const manufacturers = useMemo(() => {
     const map = new Map();
@@ -360,7 +345,7 @@ export default function App() {
       {!loading && visible.length === 0 && <div className="empty">No parts match your filters.</div>}
 
       {selected && (
-        <Detail part={selected} mode={mode} onClose={() => setSelected(null)} onAdjust={adjust} onQuick={quickAction} onLabel={() => setLabelPart(selected)} />
+        <Detail part={selected} onClose={() => setSelected(null)} onQuick={quickAction} onLabel={() => setLabelPart(selected)} />
       )}
 
       {bucketOpen && mode && (
@@ -445,15 +430,7 @@ function PartRow({ p, showAdd, mode, addLabel, onOpen, onAdd }) {
 /* ============================================================
    Detail slide-over
    ============================================================ */
-function Detail({ part, mode, onClose, onAdjust, onQuick, onLabel }) {
-  const [hist, setHist] = useState(null);
-  useEffect(() => {
-    let ok = true;
-    db.listDocuments(DB_ID, TXNS, [Query.equal('part_id', String(part.part_id)), Query.orderDesc('$createdAt'), Query.limit(6)])
-      .then((r) => { if (ok) setHist(r.documents); }).catch(() => { if (ok) setHist([]); });
-    return () => { ok = false; };
-  }, [part.part_id, part.quantity]);
-
+function Detail({ part, onClose, onQuick, onLabel }) {
   return (
     <div className="dp-scrim show" onClick={(e) => { if (e.currentTarget === e.target) onClose(); }}>
       <aside className="dp-panel" onClick={(e) => e.stopPropagation()}>
@@ -467,9 +444,8 @@ function Detail({ part, mode, onClose, onAdjust, onQuick, onLabel }) {
         <div className="dp-body">
           <div className="dp-sec">On hand</div>
           <div className="onhand-box">
-            <button className="oh-btn" onClick={() => onAdjust(part, -1)} disabled={(part.quantity || 0) <= 0} aria-label="Decrease">−</button>
             <div className="oh-num">{part.quantity || 0}</div>
-            <button className="oh-btn" onClick={() => onAdjust(part, +1)} aria-label="Increase">+</button>
+            <span className="oh-unit">on hand</span>
           </div>
           <div className="dp-actions">
             <button className="btn act-btn act-take" onClick={() => onQuick(part, 'take')}>Take</button>
@@ -492,21 +468,6 @@ function Detail({ part, mode, onClose, onAdjust, onQuick, onLabel }) {
 
           <div className="dp-sec">Linked equipment</div>
           <input className="input mono" defaultValue={part.equipment_id || ''} placeholder="EQ-1000001" readOnly />
-
-          {hist && hist.length > 0 && (
-            <>
-              <div className="dp-sec">Recent activity</div>
-              <div className="hist">
-                {hist.map((h) => (
-                  <div className="hist-row" key={h.$id}>
-                    <span className={`c ${h.qty_change > 0 ? 'up' : 'dn'}`}>{h.qty_change > 0 ? '+' : ''}{h.qty_change}</span>
-                    <span className="after">→ {h.qty_after}</span>
-                    <span className="who">{h.note || h.action}</span>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
         </div>
         <div className="dp-foot">
           <button className="btn" onClick={onLabel}>QR label</button>

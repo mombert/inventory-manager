@@ -1,838 +1,646 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { db, client, DB_ID, PARTS, TXNS, configured, ID, Query } from './appwrite';
 import CameraScanner from './CameraScanner';
-import { LabelSheet, BatchLabels } from './Labels';
-import { resolveCode, isOurLabel } from './partCode';
 import InvoicePanel from './InvoicePanel';
+import { LabelSheet, BatchLabels } from './Labels';
+import { resolveCode } from './partCode';
 
-const NFC_AVAILABLE = typeof window !== 'undefined' && 'NDEFReader' in window;
+/* ============================================================
+   Status rules
+   Low-stock threshold is the part's own `min_stock` when set,
+   otherwise a global fallback of 5 (1–5 on hand = low, 0 = out,
+   6+ = healthy). Change GLOBAL_LOW to move the fallback.
+   ============================================================ */
+const GLOBAL_LOW = 5;
+const effLow = (p) => (p.min_stock != null ? p.min_stock : GLOBAL_LOW);
+const statusOf = (p) =>
+  (p.quantity || 0) <= 0 ? 'out' : (p.quantity <= effLow(p) ? 'low' : 'ok');
+const mfrOf = (p) => (p.manufacturer || '').trim() || 'Unspecified';
+const ROOM = 'B30 — Critical Equipment Room';
 
-// Parts with no manufacturer recorded collect under one heading rather than
-// vanishing from the grouped view — the gap is itself worth being able to see.
-const UNSPECIFIED = 'Unspecified';
-const mfrOf = (p) => (p.manufacturer || '').trim() || UNSPECIFIED;
+/* Shelf order: "rack.shelf" compared as two numbers, blanks last. */
+function shelfKey(p) {
+  const s = (p.shelf_location || '').trim();
+  if (!s) return [Infinity, Infinity];
+  const seg = s.split('.');
+  const a = parseInt(seg[0], 10), b = parseInt(seg[1], 10);
+  return [isNaN(a) ? Infinity : a, isNaN(b) ? 0 : b];
+}
+function byShelf(a, b) {
+  const ka = shelfKey(a), kb = shelfKey(b);
+  if (ka[0] !== kb[0]) return ka[0] - kb[0];
+  if (ka[1] !== kb[1]) return ka[1] - kb[1];
+  return (a.part_name || '').localeCompare(b.part_name || '');
+}
+
+const MODES = {
+  take:    { label: 'Take out',  verb: 'Taking out',  dir: -1, action: 'issue'   },
+  restock: { label: 'Restock',   verb: 'Restocking',  dir: +1, action: 'receive' },
+};
+
+/* ---- small inline icons ---- */
+const Icon = {
+  check: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></svg>,
+  warn:  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 9v4M12 17v.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>,
+  x:     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg>,
+  grid:  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>,
+  rows:  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>,
+  scan:  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20v.01M20 20v.01"/></svg>,
+  sun:   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>,
+  moon:  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>,
+};
+const statusIcon = { ok: <span className="s-ok">{Icon.check}</span>, low: <span className="s-low">{Icon.warn}</span>, out: <span className="s-out">{Icon.x}</span> };
+const statusLabel = { ok: 'Healthy', low: 'Low', out: 'Out' };
 
 export default function App() {
-  const [parts, setParts] = useState([]);
+  const [parts, setParts]     = useState([]);
   const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState(null);
+  const [err, setErr]         = useState(null);
 
-  const [flash, setFlash] = useState(null);
-  const [pending, setPending] = useState(null);
-  const [hitId, setHitId] = useState(null);
-
+  const [theme, setTheme] = useState(() => { try { return localStorage.getItem('sp-theme') || 'dark'; } catch (e) { return 'dark'; } });
+  const [view, setView]   = useState('cards');
+  const [tab, setTab]     = useState('all');
   const [query, setQuery] = useState('');
-  const [filter, setFilter] = useState('all');
-  const [mfr, setMfr] = useState('all');
-  const [groupMfr, setGroupMfr] = useState(false);
-  const [area, setArea] = useState('all');
   const [shelf, setShelf] = useState('all');
+  const [mfr, setMfr]     = useState('all');
 
-  const [selected, setSelected] = useState(null);
-  const [adding, setAdding] = useState(false);
-  const [nfcOn, setNfcOn] = useState(false);
-  const [camOpen, setCamOpen] = useState(false);
-  const [labelFor, setLabelFor] = useState(null);
-  const [batchOpen, setBatchOpen] = useState(false);
+  const [selected, setSelected]   = useState(null);   // detail
+  const [camOpen, setCamOpen]     = useState(false);
+  const [labelPart, setLabelPart] = useState(null);   // single QR label
 
+  // session (take / restock)
+  const [mode, setMode]         = useState(null);
+  const [cart, setCart]         = useState({});        // part_id -> qty (existing parts)
+  const [newParts, setNewParts] = useState([]);        // typed-in new parts (restock)
+  const [bucketOpen, setBucketOpen] = useState(false);
+  const [newPartOpen, setNewPartOpen] = useState(false);
+  const [batchLabels, setBatchLabels] = useState(null); // list to print after a receive
 
-  /* ---------------- data ---------------- */
-
-  // Appwrite caps a page at 100 documents, so we page through.
-  const loadParts = useCallback(async () => {
-    try {
-      const all = [];
-      let cursor = null;
-      for (let guard = 0; guard < 40; guard++) {
-        const queries = [Query.limit(100), Query.orderAsc('part_name')];
-        if (cursor) queries.push(Query.cursorAfter(cursor));
-        const res = await db.listDocuments(DB_ID, PARTS, queries);
-        all.push(...res.documents);
-        if (res.documents.length < 100) break;
-        cursor = res.documents[res.documents.length - 1].$id;
-      }
-      setParts(all);
-      setLoadError(null);
-    } catch (e) {
-      setLoadError(e.message || 'Could not reach the database');
-    }
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef();
+  const flash = useCallback((text) => {
+    setToast(text); clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 4200);
   }, []);
 
+  /* theme */
   useEffect(() => {
-    if (!configured) { setLoading(false); return; }
-    (async () => { await loadParts(); setLoading(false); })();
+    document.documentElement.setAttribute('data-theme', theme);
+    try { localStorage.setItem('sp-theme', theme); } catch (e) {}
+  }, [theme]);
 
-    let unsub = () => {};
+  /* load + realtime */
+  useEffect(() => {
+    if (!configured) { setErr('App is not configured — check the Appwrite environment variables.'); setLoading(false); return; }
+    let unsub;
+    (async () => {
+      try {
+        const res = await db.listDocuments(DB_ID, PARTS, [Query.limit(1000)]);
+        setParts(res.documents);
+      } catch (e) { setErr(e.message || 'Could not load parts'); }
+      finally { setLoading(false); }
+    })();
     try {
-      unsub = client.subscribe(
-        `databases.${DB_ID}.collections.${PARTS}.documents`,
-        () => loadParts()
-      );
-    } catch (e) { /* realtime optional */ }
-    return () => { try { unsub(); } catch (e) {} };
-  }, [loadParts]);
+      unsub = client.subscribe(`databases.${DB_ID}.collections.${PARTS}.documents`, (ev) => {
+        const d = ev.payload;
+        setParts((prev) => {
+          if (ev.events.some((e) => e.endsWith('.delete'))) return prev.filter((x) => x.$id !== d.$id);
+          const i = prev.findIndex((x) => x.$id === d.$id);
+          if (i === -1) return [...prev, d];
+          const c = prev.slice(); c[i] = d; return c;
+        });
+      });
+    } catch (e) {}
+    return () => { try { unsub && unsub(); } catch (e) {} };
+  }, []);
 
-  /* ---------------- quantity ---------------- */
-
-  async function adjust(part, delta) {
-    const next = Math.max(0, part.quantity + delta);
+  /* single-part quick adjust (detail +/-) — logged without a name */
+  const adjust = useCallback(async (part, delta) => {
+    const next = Math.max(0, (part.quantity || 0) + delta);
     if (next === part.quantity) return;
-
     setParts((p) => p.map((x) => (x.$id === part.$id ? { ...x, quantity: next } : x)));
     setSelected((s) => (s && s.$id === part.$id ? { ...s, quantity: next } : s));
-
     try {
       await db.updateDocument(DB_ID, PARTS, part.$id, { quantity: next });
       await db.createDocument(DB_ID, TXNS, ID.unique(), {
-        part_id: part.part_id,
-        action: delta < 0 ? 'issue' : 'receive',
-        qty_change: delta,
-        qty_after: next,
+        part_id: part.part_id, action: delta < 0 ? 'issue' : 'receive',
+        qty_change: delta, qty_after: next, note: 'Quick adjust',
       });
-    } catch (e) {
-      setFlash({ tone: 'err', text: `Could not save: ${e.message}` });
-      loadParts();
-    }
-  }
+    } catch (e) { setErr(e.message); }
+  }, []);
 
-  /* ---------------- scanning ---------------- */
-
-  const handleCode = useCallback((raw, kind) => {
-    const code = String(raw || '').trim();
-    if (!code) return;
-
-    const { part: match, via } = resolveCode(parts, code, kind);
-
-    if (match) {
-      setSelected(match);
-      setHitId(match.$id);
-      setTimeout(() => setHitId(null), 1200);
-      const how = via === 'label' ? 'QR label'
-        : via === 'part_id' ? 'part ID'
-        : via === 'ek' ? 'EK number'
-        : 'tag';
-      setFlash({ tone: 'ok', text: `${match.part_name} — ${match.quantity} on hand (matched by ${how})`, code });
-      setPending(null);
-      return;
-    }
-
-    // The camera resolves our own QR labels and nothing else, so a scan
-    // that misses is a dead label rather than something to assign. Two
-    // different failures, and the difference is worth telling someone:
-    // a numeric code is a label whose part is gone, anything else was
-    // never one of ours.
-    if (kind !== 'nfc') {
-      const ours = isOurLabel(code) || /^[A-Za-z0-9-]{1,16}$/.test(code);
-      setFlash({
-        tone: 'err',
-        text: ours
-          ? 'That label points at a part ID that is not in the database'
-          : 'Not a parts label — the scanner reads QR labels printed from this app',
-        code,
-      });
-      setPending(null);
-      return;
-    }
-
-    // NFC tags stay assignable: hold an unknown tag, then tap a part.
-    setFlash({ tone: 'miss', text: 'Tag not in the database yet', code });
-    setPending({ code, kind });
-  }, [parts]);
-
-  async function startNfc() {
-    if (!NFC_AVAILABLE) {
-      setFlash({ tone: 'err', text: 'NFC needs Chrome on Android. Use the camera scanner instead.' });
-      return;
-    }
-    try {
-      const ndef = new window.NDEFReader();
-      await ndef.scan();
-      setNfcOn(true);
-      setFlash({ tone: 'ok', text: 'NFC reader on — hold a tag to the tablet' });
-      ndef.onreading = (e) => handleCode(e.serialNumber, 'nfc');
-      ndef.onreadingerror = () => setFlash({ tone: 'err', text: 'Could not read that tag. Try again.' });
-    } catch (err) {
-      setFlash({ tone: 'err', text: `NFC blocked: ${err.message}` });
-    }
-  }
-
-  function onCameraDetect(code) {
-    setCamOpen(false);
-    handleCode(code, 'scan');
-  }
-
-  async function linkPending(part) {
-    if (!pending) return;
-    try {
-      await db.updateDocument(DB_ID, PARTS, part.$id, { nfc_tag_id: pending.code });
-      setFlash({ tone: 'ok', text: `Linked tag to ${part.part_name}`, code: pending.code });
-      setPending(null);
-      loadParts();
-    } catch (e) {
-      setFlash({ tone: 'err', text: `Could not link: ${e.message}` });
-    }
-  }
-
-  /* ---------------- derived ---------------- */
-
-  const stats = useMemo(() => {
-    const low = parts.filter((p) => p.min_stock != null && p.quantity <= p.min_stock && p.quantity > 0).length;
-    const out = parts.filter((p) => p.quantity === 0).length;
-    const units = parts.reduce((s, p) => s + (p.quantity || 0), 0);
-    const shelves = new Set(parts.map((p) => (p.shelf_location || '').trim()).filter(Boolean)).size;
-    return { total: parts.length, low, out, units, shelves, healthy: parts.length - low - out };
-  }, [parts]);
-
-  // Areas come from the data, so a new location becomes a filter with no code change.
-  const areas = useMemo(() => {
-    const map = new Map();
-    parts.forEach((p) => {
-      const a = (p.location || '').trim();
-      if (a) map.set(a, (map.get(a) || 0) + 1);
-    });
-    return [...map.entries()].sort((x, y) => x[0].localeCompare(y[0]));
-  }, [parts]);
-
-  // Shelves are scoped to the chosen area and sorted like you'd walk the racks
-  // (1.1, 2.1, 11.2 — not alphabetically, where 11.2 lands before 2.1).
-  const shelves = useMemo(() => {
-    const map = new Map();
-    parts.forEach((p) => {
-      if (area !== 'all' && (p.location || '').trim() !== area) return;
-      const s = (p.shelf_location || '').trim();
-      if (s) map.set(s, (map.get(s) || 0) + 1);
-    });
-    const num = (s) => s.split('.').map((n) => parseFloat(n) || 0);
-    return [...map.entries()].sort((x, y) => {
-      const [a1, a2 = 0] = num(x[0]);
-      const [b1, b2 = 0] = num(y[0]);
-      return a1 - b1 || a2 - b2 || x[0].localeCompare(y[0]);
-    });
-  }, [parts, area]);
-
-  // Manufacturers ordered by how many parts each supplies, so the vendors
-  // you actually deal with sit at the top of a 170-part dropdown.
+  /* ---------- derived ---------- */
   const manufacturers = useMemo(() => {
     const map = new Map();
     parts.forEach((p) => { const m = mfrOf(p); map.set(m, (map.get(m) || 0) + 1); });
-    return [...map.entries()].sort((x, y) => {
-      if (x[0] === UNSPECIFIED) return 1;
-      if (y[0] === UNSPECIFIED) return -1;
-      return y[1] - x[1] || x[0].localeCompare(y[0]);
-    });
+    return [...map.entries()].sort((x, y) => (x[0] === 'Unspecified' ? 1 : y[0] === 'Unspecified' ? -1 : y[1] - x[1] || x[0].localeCompare(y[0])));
   }, [parts]);
+
+  const shelves = useMemo(() =>
+    [...new Set(parts.map((p) => (p.shelf_location || '').trim()).filter(Boolean))]
+      .sort((a, b) => (parseFloat(a) - parseFloat(b)) || a.localeCompare(b)), [parts]);
+
+  const stats = useMemo(() => {
+    let low = 0, out = 0, ok = 0;
+    parts.forEach((p) => { const s = statusOf(p); if (s === 'low') low++; else if (s === 'out') out++; else ok++; });
+    const units = parts.reduce((s, p) => s + (p.quantity || 0), 0);
+    return { total: parts.length, low, out, ok, units, shelves: shelves.length };
+  }, [parts, shelves]);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     return parts.filter((p) => {
-      if (filter === 'low' && !(p.min_stock != null && p.quantity <= p.min_stock && p.quantity > 0)) return false;
-      if (filter === 'zero' && p.quantity !== 0) return false;
-      if (mfr !== 'all' && mfrOf(p) !== mfr) return false;
-      if (area !== 'all' && (p.location || '').trim() !== area) return false;
+      const st = statusOf(p);
+      if (tab !== 'all' && st !== tab) return false;
       if (shelf !== 'all' && (p.shelf_location || '').trim() !== shelf) return false;
-      if (!q) return true;
-      return [p.part_id, p.part_name, p.manufacturer, p.model, p.ek_stock_number,
-              p.shelf_location, p.location, p.comments]
-        .some((v) => (v || '').toString().toLowerCase().includes(q));
+      if (mfr !== 'all' && mfrOf(p) !== mfr) return false;
+      if (q) {
+        const hay = [p.part_id, p.part_name, p.manufacturer, p.model, p.ek_stock_number, p.shelf_location, p.comments].join(' ').toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    }).sort(byShelf);
+  }, [parts, query, tab, shelf, mfr]);
+
+  const scopeTitle = mfr !== 'all' ? mfr : shelf !== 'all' ? `Shelf ${shelf}` :
+    tab === 'low' ? 'Low stock' : tab === 'out' ? 'Out of stock' : tab === 'ok' ? 'Healthy' : 'All parts';
+
+  /* ---------- session ---------- */
+  const cartUnits = useMemo(() => Object.values(cart).reduce((a, b) => a + b, 0), [cart]);
+  const newUnits  = useMemo(() => newParts.reduce((a, p) => a + p.quantity, 0), [newParts]);
+  const sessionUnits = cartUnits + (mode === 'restock' ? newUnits : 0);
+
+  function startMode(m) {
+    if (mode === m) { setBucketOpen(true); return; }
+    if (mode && (cartUnits > 0 || newParts.length)) { flash(`Finish or clear your ${MODES[mode].label} list first.`); return; }
+    setMode(m); setCart({}); setNewParts([]);
+  }
+  function cancelMode() { setMode(null); setCart({}); setNewParts([]); setBucketOpen(false); }
+
+  function addToCart(id) {
+    const p = parts.find((x) => x.part_id === id);
+    if (!p) { flash(`No part with ID ${id}`); return; }
+    setCart((c) => {
+      const cur = c[id] || 0;
+      if (mode === 'take') {
+        if (p.quantity <= 0) { flash(`${p.part_name} is out of stock.`); return c; }
+        if (cur >= p.quantity) { flash(`Only ${p.quantity} on hand for ${p.part_name}.`); return c; }
+      }
+      flash(`${MODES[mode] ? MODES[mode].verb : 'Added'} ${p.part_name}`);
+      return { ...c, [id]: cur + 1 };
     });
-  }, [parts, query, filter, mfr, area, shelf]);
-
-  // Grouping runs on the filtered set, so it reorganises what you are
-  // already looking at instead of quietly widening it.
-  const grouped = useMemo(() => {
-    if (!groupMfr) return null;
-    const map = new Map();
-    visible.forEach((p) => {
-      const m = mfrOf(p);
-      if (!map.has(m)) map.set(m, []);
-      map.get(m).push(p);
-    });
-    return [...map.entries()].sort((x, y) => {
-      if (x[0] === UNSPECIFIED) return 1;
-      if (y[0] === UNSPECIFIED) return -1;
-      return x[0].localeCompare(y[0]);
-    });
-  }, [visible, groupMfr]);
-
-  const narrowed = query !== '' || filter !== 'all' || mfr !== 'all' || area !== 'all' || shelf !== 'all';
-  function clearFilters() { setQuery(''); setFilter('all'); setMfr('all'); setArea('all'); setShelf('all'); }
-
-  /* ---------------- render ---------------- */
-
-  if (!configured) {
-    return (
-      <div className="state">
-        <h3>Connect the database</h3>
-        <p>Add the Appwrite endpoint, project ID and database ID in Vercel, then redeploy.</p>
-      </div>
-    );
+  }
+  function setCartQty(id, q) {
+    const p = parts.find((x) => x.part_id === id);
+    const max = mode === 'take' && p ? p.quantity : 9999;
+    q = Math.max(0, Math.min(q, max));
+    setCart((c) => { const n = { ...c }; if (q === 0) delete n[id]; else n[id] = q; return n; });
   }
 
+  function quickAction(part, m) {
+    if (mode && mode !== m && (cartUnits > 0 || newParts.length)) { flash(`Finish your ${MODES[mode].label} list first.`); return; }
+    if (mode !== m) { setMode(m); setCart({}); setNewParts([]); }
+    setTimeout(() => addToCart(part.part_id), 0);
+    setSelected(null);
+  }
+
+  function nextId() {
+    let mx = 0;
+    parts.concat(newParts).forEach((p) => { const k = parseInt(p.part_id, 10); if (!isNaN(k) && k > mx) mx = k; });
+    return String(mx + 1);
+  }
+
+  /* commit a session */
+  async function checkout(name) {
+    if (!name) { flash('A name is required.'); return; }
+    const M = MODES[mode];
+    const ids = Object.keys(cart);
+    if (!ids.length && !(mode === 'restock' && newParts.length)) return;
+
+    setBucketOpen(false);
+    const created = [];
+    try {
+      for (const id of ids) {
+        const p = parts.find((x) => x.part_id === id); if (!p) continue;
+        const q = cart[id];
+        const next = Math.max(0, p.quantity + M.dir * q);
+        await db.updateDocument(DB_ID, PARTS, p.$id, { quantity: next });
+        await db.createDocument(DB_ID, TXNS, ID.unique(), {
+          part_id: p.part_id, action: M.action, qty_change: M.dir * q, qty_after: next, note: name,
+        });
+      }
+      if (mode === 'restock') {
+        for (const np of newParts) {
+          const row = {
+            part_id: np.part_id, part_name: np.part_name, manufacturer: np.manufacturer || null,
+            model: np.model || null, ek_stock_number: np.ek_stock_number || null,
+            equipment_id: np.equipment_id || null, location: np.location || ROOM,
+            shelf_location: np.shelf_location || null, quantity: np.quantity,
+            min_stock: np.min_stock != null ? np.min_stock : null, comments: np.comments || null,
+          };
+          const doc = await db.createDocument(DB_ID, PARTS, ID.unique(), row);
+          await db.createDocument(DB_ID, TXNS, ID.unique(), {
+            part_id: row.part_id, action: 'create', qty_change: row.quantity, qty_after: row.quantity, note: `New — received by ${name}`,
+          });
+          created.push(doc);
+        }
+      }
+    } catch (e) { setErr(e.message); }
+
+    const units = sessionUnits;
+    const nParts = ids.length + created.length;
+    setCart({}); setNewParts([]); setMode(null);
+    const verb = M.dir < 0 ? 'took' : 'received';
+    flash(`${name} ${verb} ${units} unit${units === 1 ? '' : 's'} across ${nParts} part${nParts === 1 ? '' : 's'}.`);
+    if (created.length) setBatchLabels(created);
+  }
+
+  /* ---------- scan ---------- */
+  function handleScan(code) {
+    setCamOpen(false);
+    const { part } = resolveCode(parts, code);
+    if (!part) {
+      flash(mode === 'restock' ? 'Unknown label — use “+ New part” to create it.' : `No part matches ${code}.`);
+      return;
+    }
+    if (mode) addToCart(part.part_id);
+    else setSelected(part);
+  }
+
+  /* ---------- render ---------- */
+  const showAdd = Boolean(mode);
+  const addLabel = mode ? MODES[mode].label : '';
+
   return (
-    <div className="app">
-      {/* ── sidebar ─────────────────────────────────────────── */}
-      <aside className="sidenav">
+    <div className="wrap">
+      <header className="topbar">
         <div className="brand">
-          <div className="brand-mark" aria-hidden="true" />
-          <div>
-            <div className="brand-name">Spare Parts</div>
-            <div className="brand-sub">B30 Critical Equipment</div>
-          </div>
+          <h1><span className="dot" />Spare Parts</h1>
+          <div className="sub">{ROOM} · <b>{stats.total}</b> parts · <b>{stats.shelves}</b> shelves · <b>{stats.units.toLocaleString()}</b> units</div>
         </div>
+        <button className="theme-toggle" onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))} title="Toggle light / dark">
+          {theme === 'dark' ? Icon.sun : Icon.moon}<span>{theme === 'dark' ? 'Light' : 'Night'}</span>
+        </button>
+      </header>
 
-        <div className="nav-label">Inventory</div>
-        <nav className="nav">
-          <button className={`nav-item${filter === 'all' ? ' on' : ''}`} onClick={() => setFilter('all')}>
-            <span>All parts</span><span className="n">{stats.total}</span>
-          </button>
-          <button className={`nav-item${filter === 'low' ? ' on' : ''}`} onClick={() => setFilter('low')}>
-            <span>Low stock</span><span className="n">{stats.low}</span>
-          </button>
-          <button className={`nav-item${filter === 'zero' ? ' on' : ''}`} onClick={() => setFilter('zero')}>
-            <span>Out of stock</span><span className="n">{stats.out}</span>
-          </button>
-        </nav>
-
-        <div className="room-card">
-          <div className="room-t">Active room</div>
-          <div className="room-v">B30 — Critical Equipment Room</div>
-          <div className="room-n">{stats.shelves} shelf positions · {stats.units} units</div>
-        </div>
-      </aside>
-
-      {/* ── main column ─────────────────────────────────────── */}
-      <div className="main">
-        <header className="topbar">
-          <div className="topbar-title">
-            <h2>B30 — Critical Equipment Room</h2>
-            <span>{stats.total} parts tracked</span>
-          </div>
-          <button type="button" onClick={() => setCamOpen(true)} className="btn btn-cam">Scan a label</button>
-          <button type="button" onClick={startNfc} className={`btn btn-nfc${nfcOn ? ' live' : ''}`} disabled={nfcOn}>
-            {nfcOn ? 'NFC on' : 'NFC'}
-          </button>
-          <button type="button" onClick={() => setAdding(true)} className="btn btn-primary">Add part</button>
-        </header>
-
-        {flash && (
-          <div className={`flash ${flash.tone}`}>
-            {flash.code && <code>{flash.code}</code>}
-            <span>{flash.text}</span>
-            <span className="spacer" />
-            <button onClick={() => { setFlash(null); setPending(null); }}>Dismiss</button>
-          </div>
-        )}
-
-        {pending && (
-          <div className="flash miss">
-            <span>Tap a part below to link tag <code>{pending.code}</code>, or</span>
-            <button onClick={() => setAdding(true)}>add it as a new part</button>
-            <span className="spacer" />
-            <button onClick={() => setPending(null)}>Cancel</button>
-          </div>
-        )}
-
-        <main className="content">
-          <h1 className="page-h1">Parts</h1>
-          <p className="page-sub">Everything stocked in B30, by rack and shelf.</p>
-
-          {/* stat cards */}
-          <div className="stats">
-            <div className="stat">
-              <div className="stat-head"><span className="stat-ic blue" />Total parts</div>
-              <div className="stat-v">{stats.total}</div>
-              <div className="stat-n">Across {stats.shelves} shelf positions</div>
-            </div>
-            <div className="stat">
-              <div className="stat-head"><span className="stat-ic amber" />At or below minimum</div>
-              <div className={`stat-v${stats.low ? ' amber' : ''}`}>{stats.low}</div>
-              <div className="stat-n">Reorder before the next PM window</div>
-            </div>
-            <div className="stat">
-              <div className="stat-head"><span className="stat-ic red" />Out of stock</div>
-              <div className={`stat-v${stats.out ? ' red' : ''}`}>{stats.out}</div>
-              <div className="stat-n">Nothing on the shelf right now</div>
-            </div>
-            <div className="stat">
-              <div className="stat-head"><span className="stat-ic green" />Healthy</div>
-              <div className="stat-v">{stats.healthy}</div>
-              <div className="stat-n">{stats.units} units counted in total</div>
-            </div>
-          </div>
-
-          {/* filter bar */}
-          <div className="filters">
-            <div className="fsearch">
-              <input type="search" value={query} onChange={(e) => setQuery(e.target.value)}
-                     placeholder="Search name, ID, manufacturer, model, shelf…" />
-            </div>
-
-            {areas.length > 1 && (
-              <div className="fgroup">
-                <span className="flabel">Area</span>
-                <button className={`chip${area === 'all' ? ' on' : ''}`}
-                        onClick={() => { setArea('all'); setShelf('all'); }}>
-                  All areas
-                </button>
-                {areas.map(([a, n]) => (
-                  <button key={a} className={`chip${area === a ? ' on' : ''}`}
-                          onClick={() => { setArea(a); setShelf('all'); }}>
-                    {a.replace(/^B30\s*-\s*/, '')} <span className="n">{n}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-
-            <div className="fgroup">
-              <span className="flabel">Shelf</span>
-              <select className="fselect" value={shelf} onChange={(e) => setShelf(e.target.value)}>
-                <option value="all">All shelves ({shelves.length})</option>
-                {shelves.map(([s, n]) => (
-                  <option key={s} value={s}>Shelf {s} — {n} part{n === 1 ? '' : 's'}</option>
-                ))}
-              </select>
-            </div>
-
-            <div className="fgroup">
-              <span className="flabel">Manufacturer</span>
-              <select className="fselect" value={mfr} onChange={(e) => setMfr(e.target.value)}>
-                <option value="all">All manufacturers ({manufacturers.length})</option>
-                {manufacturers.map(([m, c]) => (
-                  <option key={m} value={m}>{m} — {c} part{c === 1 ? '' : 's'}</option>
-                ))}
-              </select>
-              <button className={`chip${groupMfr ? ' on' : ''}`}
-                      onClick={() => setGroupMfr((g) => !g)}
-                      title="Break the list into a section per manufacturer">
-                Group by maker
-              </button>
-            </div>
-
-            {narrowed && <button className="fclear" onClick={clearFilters}>Clear filters</button>}
-          </div>
-
-          {/* parts table */}
-          <div className="card">
-            <div className="card-head">
-              <span className="card-t">
-                {shelf !== 'all' ? `Shelf ${shelf}`
-                  : filter === 'low' ? 'Low stock'
-                  : filter === 'zero' ? 'Out of stock'
-                  : mfr !== 'all' ? mfr
-                  : area !== 'all' ? area.replace(/^B30\s*-\s*/, '')
-                  : 'All parts'}
-              </span>
-              <div className="card-actions">
-                <span className="card-n">{visible.length} of {stats.total} shown</span>
-                <button className="btn btn-sm" onClick={() => setBatchOpen(true)}
-                        disabled={visible.length === 0}>
-                  Print {visible.length === stats.total ? 'all' : visible.length} label{visible.length === 1 ? '' : 's'}
-                </button>
-              </div>
-            </div>
-
-            {!loading && !loadError && visible.length > 0 && (
-              <div className="row-head">
-                <div>Part</div>
-                <div>Manufacturer</div>
-                <div>Shelf</div>
-                <div>On hand</div>
-                <div>Status</div>
-              </div>
-            )}
-
-            <div className="list">
-              {loadError && <div className="state"><h3>Could not load parts</h3><p>{loadError}</p></div>}
-              {loading && !loadError && <div className="state"><p>Loading parts…</p></div>}
-              {!loading && !loadError && visible.length === 0 && (
-                <div className="state">
-                  <h3>Nothing matches</h3>
-                  <p>{parts.length === 0
-                    ? 'Import your parts CSV in Appwrite to get started.'
-                    : 'Clear a filter or search a different part number.'}</p>
-                  {narrowed && parts.length > 0 && (
-                    <button className="btn" onClick={clearFilters}>Clear filters</button>
-                  )}
-                </div>
-              )}
-              {grouped
-                ? grouped.map(([name, rows]) => (
-                    <div className="mgroup" key={name}>
-                      <div className="mgroup-head">
-                        <span className={name === UNSPECIFIED ? 'faint' : ''}>{name}</span>
-                        <span className="n">{rows.length}</span>
-                      </div>
-                      {rows.map((p) => (
-                        <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
-                                 onOpen={() => (pending ? linkPending(p) : setSelected(p))} onAdjust={adjust} />
-                      ))}
-                    </div>
-                  ))
-                : visible.map((p) => (
-                    <PartRow key={p.$id} part={p} hit={hitId === p.$id} linking={Boolean(pending)}
-                             onOpen={() => (pending ? linkPending(p) : setSelected(p))} onAdjust={adjust} />
-                  ))}
-            </div>
-          </div>
-        </main>
+      <div className="toolbar">
+        <button className={`btn act-btn act-take${mode === 'take' ? ' on' : ''}`} onClick={() => startMode('take')}>Take out</button>
+        <button className={`btn act-btn act-restock${mode === 'restock' ? ' on' : ''}`} onClick={() => startMode('restock')}>Restock</button>
+        <button className="btn" onClick={() => setCamOpen(true)}>{Icon.scan}Scan a label</button>
       </div>
 
+      {mode && (
+        <div className={`mode-bar m-${mode}`}>
+          <span className="mb-dot" />
+          <span className="mb-text"><b>{MODES[mode].verb}</b> — tap “Add” on parts{mode === 'restock' ? ', or add a new one' : ''}, then review.</span>
+          <span style={{ flex: 1 }} />
+          {mode === 'restock' && <button className="btn btn-sm" onClick={() => setNewPartOpen(true)}>+ New part</button>}
+          <button className="btn btn-sm" onClick={() => setBucketOpen(true)}>Review ({sessionUnits})</button>
+          <button className="btn btn-sm" onClick={cancelMode}>Cancel</button>
+        </div>
+      )}
+
+      <div className="tabs">
+        <button className={`tab t-all${tab === 'all' ? ' on' : ''}`} onClick={() => setTab('all')}>{Icon.grid}<span>All parts</span><span className="cnt">{stats.total}</span></button>
+        <button className={`tab t-low${tab === 'low' ? ' on' : ''}`} onClick={() => setTab('low')}>{Icon.warn}<span>Low stock</span><span className="cnt">{stats.low}</span></button>
+        <button className={`tab t-out${tab === 'out' ? ' on' : ''}`} onClick={() => setTab('out')}>{Icon.x}<span>Out of stock</span><span className="cnt">{stats.out}</span></button>
+        <button className={`tab t-ok${tab === 'ok' ? ' on' : ''}`} onClick={() => setTab('ok')}>{Icon.check}<span>Healthy</span><span className="cnt">{stats.ok}</span></button>
+      </div>
+
+      <div className="filters">
+        <div className="field grow">
+          <label>Search</label>
+          <input className="input" placeholder="Name, part ID, manufacturer, model, shelf…" value={query} onChange={(e) => setQuery(e.target.value)} />
+        </div>
+        <div className="field">
+          <label>Shelf</label>
+          <select className="select" value={shelf} onChange={(e) => setShelf(e.target.value)}>
+            <option value="all">All shelves ({shelves.length})</option>
+            {shelves.map((s) => <option key={s} value={s}>Shelf {s}</option>)}
+          </select>
+        </div>
+        <div className="field">
+          <label>Manufacturer</label>
+          <select className="select" value={mfr} onChange={(e) => setMfr(e.target.value)}>
+            <option value="all">All manufacturers ({manufacturers.length})</option>
+            {manufacturers.map(([m, c]) => <option key={m} value={m}>{m} — {c}</option>)}
+          </select>
+        </div>
+        <div className="viewtoggle">
+          <button className={view === 'cards' ? 'on' : ''} onClick={() => setView('cards')}>{Icon.grid}Cards</button>
+          <button className={view === 'table' ? 'on' : ''} onClick={() => setView('table')}>{Icon.rows}Table</button>
+        </div>
+      </div>
+
+      <div className="result-head">
+        <h2>{scopeTitle}</h2>
+        <span className="shown">{visible.length} of {stats.total} shown</span>
+      </div>
+
+      {loading && <div className="state">Loading…</div>}
+      {err && <div className="err-box">{err}</div>}
+
+      {!loading && view === 'cards' && visible.length > 0 && (
+        <div className="cards">
+          {visible.map((p) => <PartCard key={p.$id} p={p} showAdd={showAdd} mode={mode} addLabel={addLabel} onOpen={() => setSelected(p)} onAdd={() => addToCart(p.part_id)} />)}
+        </div>
+      )}
+
+      {!loading && view === 'table' && visible.length > 0 && (
+        <div className="tablewrap">
+          <table>
+            <thead><tr><th>Part</th><th>Shelf</th><th>Manufacturer</th><th>Model</th><th>EK stock</th><th className="num">On hand</th><th>Status</th><th /></tr></thead>
+            <tbody>
+              {visible.map((p) => <PartRow key={p.$id} p={p} showAdd={showAdd} mode={mode} addLabel={addLabel} onOpen={() => setSelected(p)} onAdd={() => addToCart(p.part_id)} />)}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {!loading && visible.length === 0 && <div className="empty">No parts match your filters.</div>}
+
       {selected && (
-        <Detail part={parts.find((p) => p.$id === selected.$id) || selected}
-                onClose={() => setSelected(null)} onAdjust={adjust} onSaved={loadParts}
-                onPrintLabel={(p) => { setSelected(null); setLabelFor(p); }} />
+        <Detail part={selected} mode={mode} onClose={() => setSelected(null)} onAdjust={adjust} onQuick={quickAction} onLabel={() => setLabelPart(selected)} />
       )}
 
-      {camOpen && (
-        <CameraScanner onDetect={onCameraDetect} onClose={() => setCamOpen(false)} />
-      )}
-
-      {labelFor && (
-        <LabelSheet part={labelFor} onClose={() => setLabelFor(null)} />
-      )}
-
-      {batchOpen && (
-        <BatchLabels
-          parts={visible}
-          scopeLabel={
-            shelf !== 'all' ? `shelf ${shelf}`
-              : filter === 'low' ? 'low stock'
-              : filter === 'zero' ? 'out of stock'
-              : mfr !== 'all' ? mfr
-              : area !== 'all' ? area
-              : 'all parts'
-          }
-          onClose={() => setBatchOpen(false)}
+      {bucketOpen && mode && (
+        <Bucket
+          mode={mode} cart={cart} newParts={newParts} parts={parts} units={sessionUnits}
+          onClose={() => setBucketOpen(false)} onQty={setCartQty}
+          onRemoveNew={(i) => setNewParts((xs) => xs.filter((_, k) => k !== i))}
+          onClear={() => { setCart({}); setNewParts([]); }} onCheckout={checkout}
         />
       )}
 
-      {adding && (
-        <AddPart seedNfc={pending?.kind === 'nfc' ? pending.code : ''}
-                 parts={parts} onClose={() => setAdding(false)}
-                 onSaved={() => { setAdding(false); setPending(null); loadParts(); }} />
+      {newPartOpen && (
+        <NewPartModal
+          suggestedId={nextId()} onClose={() => setNewPartOpen(false)}
+          onSave={(np) => { setNewParts((xs) => [...xs, np]); setNewPartOpen(false); flash(`Added new part ${np.part_name} to receiving.`); }}
+          exists={(id) => parts.concat(newParts).some((p) => p.part_id === id)}
+        />
       )}
+
+      {camOpen && <CameraScanner onDetect={handleScan} onClose={() => setCamOpen(false)} />}
+      {labelPart && <LabelSheet part={labelPart} onClose={() => setLabelPart(null)} />}
+      {batchLabels && <BatchLabels parts={batchLabels} scopeLabel="new parts" onClose={() => setBatchLabels(null)} />}
+
+      {toast && <div className="toast show">{toast}</div>}
     </div>
   );
 }
 
-/* ================= row ================= */
-
-function PartRow({ part, hit, linking, onOpen, onAdjust }) {
-  const out = part.quantity === 0;
-  const low = !out && part.min_stock != null && part.quantity <= part.min_stock;
-  const tone = out ? 'out' : low ? 'low' : 'ok';
-  const label = out ? 'Out of stock' : low ? 'Low stock' : 'In stock';
-
-  // Fill shows how far above the reorder point this part sits. With no
-  // minimum set there is nothing to measure against, so the bar is hidden.
-  const min = part.min_stock;
-  const fill = min ? Math.min(100, (part.quantity / (min * 2)) * 100) : null;
-
+/* ============================================================
+   Card / Row
+   ============================================================ */
+function Badges({ p }) {
   return (
-    <div className={`row${out ? ' zero' : low ? ' flagged' : ''}${hit ? ' hit' : ''}`}>
-      <div className="name" onClick={onOpen} role="button" tabIndex={0}
-           onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && onOpen()}>
-        <b>{part.part_name}</b>
-        <div className="meta">
-          <span className="pid">{part.part_id}</span>
-          {part.ek_stock_number && <span className="ek">EK {part.ek_stock_number}</span>}
-        </div>
-        <div className="tags">
-          {linking && <span className="tag">TAP TO LINK</span>}
-          {part.nfc_tag_id && <span className="tag">NFC</span>}
-        </div>
-      </div>
-
-      <div className="mfr" onClick={onOpen}>
-        <span>{part.manufacturer || '—'}</span>
-        <span className="model">{part.model || ''}</span>
-      </div>
-
-      <div className="shelf-cell">
-        <div className={`shelf${part.shelf_location ? '' : ' none'}`}>{part.shelf_location || '—'}</div>
-      </div>
-
-      <div className="qty">
-        <button onClick={() => onAdjust(part, -1)} disabled={part.quantity === 0} aria-label="Remove one">−</button>
-        <div className="qty-read">
-          <span className={`n ${tone}`}>{part.quantity}</span>
-          <span className="min">min {min ?? '—'}</span>
-          {fill !== null && (
-            <span className="bar"><i className={tone} style={{ width: `${fill}%` }} /></span>
-          )}
-        </div>
-        <button onClick={() => onAdjust(part, +1)} aria-label="Add one">+</button>
-      </div>
-
-      <div className="status-cell">
-        <span className={`pill ${tone}`}><i />{label}</span>
-      </div>
+    <div className="badges">
+      <span className="badge">{p.part_id}</span>
+      {p.ek_stock_number && <span className="badge ek">EK {p.ek_stock_number}</span>}
+      {p.shelf_location && <span className="badge shelf">Shelf {p.shelf_location}</span>}
     </div>
   );
 }
+function PartCard({ p, showAdd, mode, addLabel, onOpen, onAdd }) {
+  const st = statusOf(p);
+  return (
+    <div className="card" onClick={onOpen}>
+      <div className="onhand">
+        <div className="qty">{p.quantity || 0}</div>
+        <div className="min">min {p.min_stock != null ? p.min_stock : '—'}</div>
+        <div className="oh-label">ON HAND</div>
+      </div>
+      <div className="body">
+        <p className="pname">{p.part_name}</p>
+        <Badges p={p} />
+        {p.manufacturer && <div className="maker">{p.manufacturer}</div>}
+        {p.model && <div className="model">{p.model}</div>}
+        {showAdd && (
+          <div className="card-actions">
+            <button className={`add-btn m-${mode}`} disabled={mode === 'take' && (p.quantity || 0) <= 0}
+              onClick={(e) => { e.stopPropagation(); onAdd(); }}>+ {addLabel}</button>
+          </div>
+        )}
+      </div>
+      <div className="status">{statusIcon[st]}</div>
+    </div>
+  );
+}
+function PartRow({ p, showAdd, mode, addLabel, onOpen, onAdd }) {
+  const st = statusOf(p);
+  return (
+    <tr onClick={onOpen}>
+      <td><div className="t-name">{p.part_name}</div><div className="t-id">{p.part_id}</div></td>
+      <td>{p.shelf_location ? <span className="t-shelf">{p.shelf_location}</span> : '—'}</td>
+      <td>{p.manufacturer || '—'}</td>
+      <td className="t-mono">{p.model || '—'}</td>
+      <td className="t-mono">{p.ek_stock_number || '—'}</td>
+      <td className="t-onhand"><div className="t-qty">{p.quantity || 0}</div><div className="t-min">min {p.min_stock != null ? p.min_stock : '—'}</div></td>
+      <td><span className={`pill ${st}`}>{statusLabel[st]}</span></td>
+      <td className="t-add">{showAdd && <button className={`add-btn m-${mode}`} disabled={mode === 'take' && (p.quantity || 0) <= 0} onClick={(e) => { e.stopPropagation(); onAdd(); }}>+ {addLabel}</button>}</td>
+    </tr>
+  );
+}
 
-/* ================= detail panel ================= */
-
-function Detail({ part, onClose, onAdjust, onSaved, onPrintLabel }) {
-  const [minStock, setMinStock] = useState(part.min_stock ?? '');
-  const [nfc, setNfc] = useState(part.nfc_tag_id || '');
-  const [shelf, setShelf] = useState(part.shelf_location || '');
-  const [eq, setEq] = useState(part.equipment_id || '');
-  const [history, setHistory] = useState([]);
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState(null);
-
+/* ============================================================
+   Detail slide-over
+   ============================================================ */
+function Detail({ part, mode, onClose, onAdjust, onQuick, onLabel }) {
+  const [hist, setHist] = useState(null);
   useEffect(() => {
-    db.listDocuments(DB_ID, TXNS, [
-      Query.equal('part_id', part.part_id),
-      Query.orderDesc('$createdAt'),
-      Query.limit(12),
-    ]).then((r) => setHistory(r.documents)).catch(() => setHistory([]));
+    let ok = true;
+    db.listDocuments(DB_ID, TXNS, [Query.equal('part_id', String(part.part_id)), Query.orderDesc('$createdAt'), Query.limit(6)])
+      .then((r) => { if (ok) setHist(r.documents); }).catch(() => { if (ok) setHist([]); });
+    return () => { ok = false; };
   }, [part.part_id, part.quantity]);
 
-  async function save() {
-    setSaving(true); setErr(null);
-    try {
-      await db.updateDocument(DB_ID, PARTS, part.$id, {
-        min_stock: minStock === '' ? null : Number(minStock),
-        nfc_tag_id: nfc.trim() || null,
-        shelf_location: shelf.trim() || null,
-        equipment_id: eq.trim() || null,
-      });
-      onSaved(); onClose();
-    } catch (e) {
-      setErr(e.message);
-    } finally { setSaving(false); }
-  }
-
   return (
-    <div className="scrim" onClick={onClose}>
-      <div className="panel" onClick={(e) => e.stopPropagation()}>
-        <div className="panel-head">
+    <div className="dp-scrim show" onClick={(e) => { if (e.currentTarget === e.target) onClose(); }}>
+      <aside className="dp-panel" onClick={(e) => e.stopPropagation()}>
+        <div className="dp-head">
           <div>
-            <h2>{part.part_name}</h2>
-            <div className="pid">PART {part.part_id}</div>
+            <h2 className="dp-title">{part.part_name}</h2>
+            <span className="dp-badge">PART {part.part_id}</span>
           </div>
-          <button className="x" onClick={onClose} aria-label="Close">×</button>
+          <button className="dp-x" onClick={onClose} aria-label="Close">×</button>
         </div>
-
-        <div className="panel-body">
-          <div className="section">
-            <h4>ON HAND</h4>
-            <div className="qty" style={{ justifyContent: 'flex-start' }}>
-              <button onClick={() => onAdjust(part, -1)} disabled={part.quantity === 0}>−</button>
-              <span className="n">{part.quantity}</span>
-              <button onClick={() => onAdjust(part, +1)}>+</button>
-            </div>
+        <div className="dp-body">
+          <div className="dp-sec">On hand</div>
+          <div className="onhand-box">
+            <button className="oh-btn" onClick={() => onAdjust(part, -1)} disabled={(part.quantity || 0) <= 0} aria-label="Decrease">−</button>
+            <div className="oh-num">{part.quantity || 0}</div>
+            <button className="oh-btn" onClick={() => onAdjust(part, +1)} aria-label="Increase">+</button>
+          </div>
+          <div className="dp-actions">
+            <button className="btn act-btn act-take" onClick={() => onQuick(part, 'take')}>Take</button>
+            <button className="btn act-btn act-restock" onClick={() => onQuick(part, 'restock')}>Restock</button>
           </div>
 
-          <div className="section">
-            <h4>DETAILS</h4>
-            <dl className="kv">
-              <dt>Manufacturer</dt><dd>{part.manufacturer || '—'}</dd>
-              <dt>Model</dt><dd className="mono">{part.model || '—'}</dd>
-              <dt>EK stock no.</dt><dd className="mono">{part.ek_stock_number || '—'}</dd>
-              <dt>Location</dt><dd>{part.location || '—'}</dd>
-              {part.comments && (<><dt>Comments</dt><dd>{part.comments}</dd></>)}
-            </dl>
-          </div>
+          <div className="dp-sec">Details</div>
+          <div className="drow"><span className="k">Manufacturer</span><span className="v">{part.manufacturer || '—'}</span></div>
+          <div className="drow"><span className="k">Model</span><span className="v mono">{part.model || '—'}</span></div>
+          <div className="drow"><span className="k">EK stock no.</span><span className="v mono">{part.ek_stock_number || '—'}</span></div>
+          <div className="drow"><span className="k">Location</span><span className="v">{part.location || ROOM}</span></div>
 
-          <div className="section">
-            <h4>SHELF &amp; REORDER</h4>
-            <div className="grid2">
-              <div className="field-row">
-                <label htmlFor="shelf">Shelf</label>
-                <input id="shelf" className="mono" value={shelf} onChange={(e) => setShelf(e.target.value)} placeholder="6.5" />
-              </div>
-              <div className="field-row">
-                <label htmlFor="min">Low-stock at</label>
-                <input id="min" className="mono" type="number" min="0" value={minStock}
-                       onChange={(e) => setMinStock(e.target.value)} placeholder="not set" />
-              </div>
-            </div>
-          </div>
-
-          <div className="section">
-            <h4>NFC TAG</h4>
-            <div className="field-row">
-              <input id="nf" className="mono" value={nfc} onChange={(e) => setNfc(e.target.value)}
-                     placeholder="Tap a tag from the main screen to assign" />
-            </div>
+          <div className="dp-sec">Shelf &amp; reorder</div>
+          <div className="dgrid2">
+            <div className="field"><label>Shelf</label><input className="input" defaultValue={part.shelf_location || ''} readOnly /></div>
+            <div className="field"><label>Low-stock at</label><input className="input" placeholder="not set" defaultValue={part.min_stock != null ? part.min_stock : ''} readOnly /></div>
           </div>
 
           <InvoicePanel partId={part.part_id} />
 
-          <div className="section">
-            <h4>LINKED EQUIPMENT</h4>
-            <div className="field-row">
-              <input className="mono" value={eq} onChange={(e) => setEq(e.target.value)} placeholder="EQ-1000001" />
-            </div>
-          </div>
+          <div className="dp-sec">Linked equipment</div>
+          <input className="input mono" defaultValue={part.equipment_id || ''} placeholder="EQ-1000001" readOnly />
 
-          {history.length > 0 && (
-            <div className="section">
-              <h4>RECENT MOVEMENT</h4>
+          {hist && hist.length > 0 && (
+            <>
+              <div className="dp-sec">Recent activity</div>
               <div className="hist">
-                {history.map((h) => (
+                {hist.map((h) => (
                   <div className="hist-row" key={h.$id}>
-                    <span className="d">{new Date(h.$createdAt).toLocaleDateString()}</span>
-                    <span className={`c ${h.qty_change > 0 ? 'up' : 'dn'}`}>
-                      {h.qty_change > 0 ? '+' : ''}{h.qty_change}
-                    </span>
-                    <span className="a">{h.action}</span>
+                    <span className={`c ${h.qty_change > 0 ? 'up' : 'dn'}`}>{h.qty_change > 0 ? '+' : ''}{h.qty_change}</span>
                     <span className="after">→ {h.qty_after}</span>
+                    <span className="who">{h.note || h.action}</span>
                   </div>
                 ))}
               </div>
-            </div>
+            </>
           )}
-
-          {err && <div className="err-box">{err}</div>}
         </div>
-
-        <div className="panel-foot">
-          <button className="btn" onClick={() => onPrintLabel(part)}>QR label</button>
-          <button className="btn btn-primary" onClick={save} disabled={saving}>
-            {saving ? 'Saving…' : 'Save changes'}
-          </button>
+        <div className="dp-foot">
+          <button className="btn" onClick={onLabel}>QR label</button>
+          <button className="btn btn-accent" style={{ flex: 2 }} onClick={onClose}>Done</button>
         </div>
-      </div>
+      </aside>
     </div>
   );
 }
 
-/* ================= add part ================= */
+/* ============================================================
+   Bucket / review
+   ============================================================ */
+function Bucket({ mode, cart, newParts, parts, units, onClose, onQty, onRemoveNew, onClear, onCheckout }) {
+  const [name, setName] = useState('');
+  const M = MODES[mode];
+  const ids = Object.keys(cart);
+  const empty = !ids.length && !(mode === 'restock' && newParts.length);
 
-function AddPart({ seedNfc, parts, onClose, onSaved }) {
-  const nextId = useMemo(() => {
-    const nums = parts.map((p) => parseInt(p.part_id, 10)).filter((n) => !isNaN(n));
-    return nums.length ? String(Math.max(...nums) + 1) : '1001';
-  }, [parts]);
+  return (
+    <div className="dp-scrim show" onClick={(e) => { if (e.currentTarget === e.target) onClose(); }}>
+      <aside className="dp-panel" onClick={(e) => e.stopPropagation()}>
+        <div className="dp-head">
+          <div><h2 className="dp-title">{M.verb}</h2><span className={`dp-badge m-${mode}`}>{units} unit{units === 1 ? '' : 's'}</span></div>
+          <button className="dp-x" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <div className="dp-body">
+          {empty && <div className="cart-empty">Nothing added yet.<br />{mode === 'restock' ? 'Add known parts, or use “+ New part”.' : 'Tap “Add” on parts to take them out.'}</div>}
 
-  const defaultLocation = parts[0]?.location || 'B30 - Critical Equipment Room';
+          {ids.map((id) => {
+            const p = parts.find((x) => x.part_id === id); if (!p) return null;
+            const q = cart[id]; const after = Math.max(0, p.quantity + M.dir * q);
+            return (
+              <div className="cart-line" key={id}>
+                <div className="ci-body">
+                  <div className="ci-name">{p.part_name}</div>
+                  <div className="ci-sub">{p.part_id}{p.shelf_location ? ` · Shelf ${p.shelf_location}` : ''} · {p.quantity} → {after}</div>
+                </div>
+                <div className="ci-step">
+                  <button onClick={() => onQty(id, q - 1)}>−</button>
+                  <span className="n">{q}</span>
+                  <button onClick={() => onQty(id, q + 1)}>+</button>
+                </div>
+                <button className="ci-rm" onClick={() => onQty(id, 0)} aria-label="Remove">×</button>
+              </div>
+            );
+          })}
 
+          {mode === 'restock' && newParts.map((np, i) => (
+            <div className="cart-line ci-new" key={`np-${i}`}>
+              <div className="ci-body">
+                <div className="ci-name">{np.part_name}<span className="ci-tag">NEW</span></div>
+                <div className="ci-sub">{np.part_id}{np.shelf_location ? ` · Shelf ${np.shelf_location}` : ''} · label will print</div>
+              </div>
+              <div className="ci-step"><span className="n">+{np.quantity}</span></div>
+              <button className="ci-rm" onClick={() => onRemoveNew(i)} aria-label="Remove">×</button>
+            </div>
+          ))}
+
+          {!empty && (
+            <>
+              <div className="dp-sec">Who is {M.verb.toLowerCase()}? (required)</div>
+              <input className="input" placeholder="Type your name" value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" />
+            </>
+          )}
+        </div>
+        <div className="dp-foot" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 12 }}>
+          <div className="cart-total"><span>Total units</span><b>{units}</b></div>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button className="btn" disabled={empty} onClick={onClear}>Clear</button>
+            <button className="btn btn-accent" style={{ flex: 2 }} disabled={empty || !name.trim()} onClick={() => onCheckout(name.trim())}>{M.label}</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+/* ============================================================
+   New part (full record)
+   ============================================================ */
+function NewPartModal({ suggestedId, onClose, onSave, exists }) {
   const [f, setF] = useState({
-    part_id: nextId, part_name: '', manufacturer: '', model: '', ek_stock_number: '',
-    location: defaultLocation, shelf_location: '', quantity: '1', min_stock: '',
-    nfc_tag_id: seedNfc || '', equipment_id: '', comments: '',
+    part_id: suggestedId, quantity: '1', part_name: '', manufacturer: '', model: '',
+    shelf_location: '', min_stock: '', location: ROOM, ek_stock_number: '', equipment_id: '', comments: '',
   });
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState(null);
-  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const set = (k) => (e) => setF((s) => ({ ...s, [k]: e.target.value }));
 
-  async function save() {
-    if (!f.part_name.trim()) { setErr('Give the part a name.'); return; }
-    if (!f.part_id.trim()) { setErr('Give the part an ID.'); return; }
-    setSaving(true); setErr(null);
-
-    const row = {
-      part_id: f.part_id.trim(),
-      part_name: f.part_name.trim(),
-      manufacturer: f.manufacturer.trim() || null,
-      model: f.model.trim() || null,
-      ek_stock_number: f.ek_stock_number.trim() || null,
-      location: f.location.trim() || null,
-      shelf_location: f.shelf_location.trim() || null,
-      quantity: Number(f.quantity) || 0,
-      min_stock: f.min_stock === '' ? null : Number(f.min_stock),
-      nfc_tag_id: f.nfc_tag_id.trim() || null,
-      equipment_id: f.equipment_id.trim() || null,
-      comments: f.comments.trim() || null,
-    };
-
-    try {
-      await db.createDocument(DB_ID, PARTS, ID.unique(), row);
-      await db.createDocument(DB_ID, TXNS, ID.unique(), {
-        part_id: row.part_id, action: 'create',
-        qty_change: row.quantity, qty_after: row.quantity, note: 'Added manually',
-      });
-      onSaved();
-    } catch (e) {
-      setErr(e.message);
-    } finally { setSaving(false); }
+  function save() {
+    const id = f.part_id.trim(), name = f.part_name.trim();
+    const qty = parseInt(f.quantity, 10);
+    if (!id) return alert('Part ID is required.');
+    if (exists(id)) return alert(`Part ID ${id} already exists.`);
+    if (!name) return alert('Part name is required.');
+    if (isNaN(qty) || qty < 0) return alert('Quantity must be 0 or more.');
+    const min = f.min_stock.trim() !== '' && !isNaN(parseInt(f.min_stock, 10)) ? parseInt(f.min_stock, 10) : null;
+    onSave({
+      part_id: id, part_name: name, manufacturer: f.manufacturer.trim(), model: f.model.trim(),
+      ek_stock_number: f.ek_stock_number.trim(), equipment_id: f.equipment_id.trim(),
+      location: f.location.trim() || ROOM, shelf_location: f.shelf_location.trim(),
+      quantity: qty, min_stock: min, comments: f.comments.trim(),
+    });
   }
 
   return (
-    <div className="scrim" onClick={onClose}>
-      <div className="panel" onClick={(e) => e.stopPropagation()}>
-        <div className="panel-head">
-          <div><h2>Add a part</h2><div className="pid">NEW RECORD</div></div>
-          <button className="x" onClick={onClose} aria-label="Close">×</button>
+    <div className="dp-scrim show" id="npScrim" onClick={(e) => { if (e.currentTarget === e.target) onClose(); }}>
+      <div className="np-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="np-head">
+          <div><h3>Add a part</h3><span className="dp-badge" style={{ marginTop: 6, display: 'inline-block' }}>NEW RECORD</span></div>
+          <button className="dp-x" onClick={onClose} aria-label="Close">×</button>
         </div>
-
-        <div className="panel-body">
-          <div className="grid2">
-            <div className="field-row">
-              <label htmlFor="a-id">Part ID</label>
-              <input id="a-id" className="mono" value={f.part_id} onChange={set('part_id')} />
-            </div>
-            <div className="field-row">
-              <label htmlFor="a-qty">Quantity</label>
-              <input id="a-qty" className="mono" type="number" min="0" value={f.quantity} onChange={set('quantity')} />
-            </div>
+        <div className="np-body">
+          <div className="dgrid2">
+            <div className="field"><label>Part ID</label><input className="input mono" value={f.part_id} onChange={set('part_id')} /></div>
+            <div className="field"><label>Quantity</label><input className="input" type="number" inputMode="numeric" min="0" value={f.quantity} onChange={set('quantity')} /></div>
           </div>
-
-          <div className="field-row">
-            <label htmlFor="a-name">Part name</label>
-            <input id="a-name" value={f.part_name} onChange={set('part_name')} placeholder='3" Butterfly valve seat' />
+          <div className="field"><label>Part name (required)</label><input className="input" value={f.part_name} onChange={set('part_name')} placeholder='3" Butterfly valve seat' /></div>
+          <div className="dgrid2">
+            <div className="field"><label>Manufacturer</label><input className="input" value={f.manufacturer} onChange={set('manufacturer')} placeholder="Alfa Laval" /></div>
+            <div className="field"><label>Model</label><input className="input" value={f.model} onChange={set('model')} /></div>
           </div>
-
-          <div className="grid2">
-            <div className="field-row">
-              <label htmlFor="a-mfr">Manufacturer</label>
-              <input id="a-mfr" value={f.manufacturer} onChange={set('manufacturer')} placeholder="Alfa Laval" />
-            </div>
-            <div className="field-row">
-              <label htmlFor="a-model">Model</label>
-              <input id="a-model" className="mono" value={f.model} onChange={set('model')} />
-            </div>
+          <div className="dgrid2">
+            <div className="field"><label>Shelf</label><input className="input" value={f.shelf_location} onChange={set('shelf_location')} placeholder="8.1" /></div>
+            <div className="field"><label>Low-stock at</label><input className="input" value={f.min_stock} onChange={set('min_stock')} placeholder="optional" inputMode="numeric" /></div>
           </div>
-
-          <div className="grid2">
-            <div className="field-row">
-              <label htmlFor="a-shelf">Shelf</label>
-              <input id="a-shelf" className="mono" value={f.shelf_location} onChange={set('shelf_location')} placeholder="8.1" />
-            </div>
-            <div className="field-row">
-              <label htmlFor="a-min">Low-stock at</label>
-              <input id="a-min" className="mono" type="number" min="0" value={f.min_stock} onChange={set('min_stock')} placeholder="optional" />
-            </div>
-          </div>
-
-          <div className="field-row">
-            <label htmlFor="a-loc">Location</label>
-            <input id="a-loc" value={f.location} onChange={set('location')} />
-          </div>
-
-          <div className="grid2">
-            <div className="field-row">
-              <label htmlFor="a-nfc">NFC tag ID</label>
-              <input id="a-nfc" className="mono" value={f.nfc_tag_id} onChange={set('nfc_tag_id')} placeholder="optional" />
-            </div>
-            <div className="field-row">
-              <label htmlFor="a-ek">EK stock number</label>
-              <input id="a-ek" className="mono" value={f.ek_stock_number} onChange={set('ek_stock_number')} placeholder="optional" />
-            </div>
-          </div>
-
-          <div className="field-row">
-            <label htmlFor="a-eq">Equipment ID</label>
-            <input id="a-eq" className="mono" value={f.equipment_id} onChange={set('equipment_id')} placeholder="EQ-1000001" />
-          </div>
-
-          <div className="field-row">
-            <label htmlFor="a-com">Comments</label>
-            <input id="a-com" value={f.comments} onChange={set('comments')} placeholder="P-231 UF V1" />
-          </div>
-
-          {err && <div className="err-box">{err}</div>}
+          <div className="field"><label>Location</label><input className="input" value={f.location} onChange={set('location')} /></div>
+          <div className="field"><label>EK stock number</label><input className="input mono" value={f.ek_stock_number} onChange={set('ek_stock_number')} placeholder="optional" /></div>
+          <div className="field"><label>Equipment ID</label><input className="input mono" value={f.equipment_id} onChange={set('equipment_id')} placeholder="EQ-1000001" /></div>
+          <div className="field"><label>Comments</label><textarea className="input" rows="2" value={f.comments} onChange={set('comments')} /></div>
+          <div className="np-note">A QR label is queued and printed with the rest at the end of receiving.</div>
         </div>
-
-        <div className="panel-foot">
+        <div className="np-foot">
           <button className="btn" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={save} disabled={saving}>
-            {saving ? 'Saving…' : 'Add part'}
-          </button>
+          <button className="btn btn-accent" style={{ flex: 2 }} onClick={save}>Add to receiving</button>
         </div>
       </div>
     </div>

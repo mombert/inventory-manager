@@ -421,7 +421,8 @@ button{touch-action:manipulation}
   .print-area .sheet:last-child{break-after:auto}
   .print-area .label-grid{display:grid;max-width:none;grid-template-columns:repeat(var(--cols),var(--w));grid-auto-rows:var(--h);column-gap:var(--gap-x);row-gap:0}
   .print-area .label-card{width:var(--w);height:var(--h);box-sizing:border-box;padding:var(--pad);gap:var(--pad);overflow:hidden;border:0!important;border-radius:0;background:#fff!important;color:#000}
-  .print-area .qr-holder{width:calc(var(--h) - 2*var(--pad))!important;height:calc(var(--h) - 2*var(--pad))!important;padding:0;border-radius:0}
+  /* QR code printed at 0.7" square */
+  .print-area .qr-holder{width:0.7in!important;height:0.7in!important;padding:0;border-radius:0}
 
   /* text: small enough to fit beside the code; long names cut to 2 lines */
   .print-area .label-meta{min-width:0;flex:1 1 auto;gap:1px}

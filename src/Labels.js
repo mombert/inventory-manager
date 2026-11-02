@@ -7,6 +7,10 @@ import { labelPayload } from './partCode';
    module count low enough to stay readable at an inch square. */
 const QR_OPTS = { type: 'svg', margin: 0, errorCorrectionLevel: 'M' };
 
+/* Labels per printed sheet. 30 = Avery 5160 / 8160 (1" x 2-5/8"); 10 = Avery 5163.
+   Must match the sizes in the @media print block at the end of index.css. */
+const PER_PAGE = 30;
+
 async function renderQr(text) {
   return QRCode.toString(text, QR_OPTS);
 }
@@ -66,8 +70,10 @@ export function LabelSheet({ part, onClose }) {
         <div className="panel-body">
 
           <div className="print-area">
-            <div className="label-grid one">
-              <Label part={part} />
+            <div className="sheet">
+              <div className="label-grid one">
+                <Label part={part} />
+              </div>
             </div>
           </div>
 
@@ -156,16 +162,20 @@ export function BatchLabels({ parts, scopeLabel, onClose }) {
           {ready && (
             <>
               <p className="label-note no-print">
-                Two labels per row, five rows per page — the Avery 5163 grid (4″ × 2″).
+                Three labels per row, ten rows per page — the Avery 5160 / 8160 grid (1″ × 2⅝″).
                 Check <b>Background graphics</b> in the print dialog, and set margins to
-                None so the grid lines up with the sheet.
+                None and scale to 100% so the grid lines up with the sheet.
               </p>
               <div className="print-area">
-                <div className="label-grid">
-                  {targets.map((p) => (
-                    <Label key={p.$id || p.part_id} part={p} qr={codes[p.$id || p.part_id]} />
-                  ))}
-                </div>
+                {Array.from({ length: Math.ceil(targets.length / PER_PAGE) }, (_, n) => (
+                  <div className="sheet" key={n}>
+                    <div className="label-grid">
+                      {targets.slice(n * PER_PAGE, (n + 1) * PER_PAGE).map((p) => (
+                        <Label key={p.$id || p.part_id} part={p} qr={codes[p.$id || p.part_id]} />
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
             </>
           )}

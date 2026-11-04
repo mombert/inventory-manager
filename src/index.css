@@ -407,7 +407,7 @@ button{touch-action:manipulation}
         --qr:0.7in;        /* QR code size */
         --pad-left:0.15in; /* space between the label's left edge and the QR code */
         /* printer correction: + moves everything right/down, - moves left/up */
-        --nudge-x:0in;--nudge-y:0in}
+        --nudge-x:0in;--nudge-y:0.15in}
   @page{size:letter;margin:0}
   html,body{margin:0!important;padding:0!important;background:#fff!important}
 

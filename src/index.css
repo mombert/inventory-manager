@@ -403,7 +403,11 @@ button{touch-action:manipulation}
    PER_PAGE in Labels.js must match (30).
    ============================================================ */
 @media print{
-  :root{--w:2.625in;--h:1in;--cols:3;--top:0.5in;--side:0.1875in;--gap-x:0.125in;--pad:0.06in}
+  :root{--w:2.625in;--h:1in;--cols:3;--top:0.5in;--side:0.1875in;--gap-x:0.125in;--pad:0.06in;
+        --qr:0.7in;        /* QR code size */
+        --pad-left:0.15in; /* space between the label's left edge and the QR code */
+        /* printer correction: + moves everything right/down, - moves left/up */
+        --nudge-x:0in;--nudge-y:0in}
   @page{size:letter;margin:0}
   html,body{margin:0!important;padding:0!important;background:#fff!important}
 
@@ -417,12 +421,11 @@ button{touch-action:manipulation}
   .panel-body{padding:0}
 
   .print-area{position:absolute;top:0;left:0;width:8.5in;margin:0!important}
-  .print-area .sheet{width:8.5in;height:11in;box-sizing:border-box;padding:var(--top) var(--side) 0;break-after:page;overflow:hidden}
+  .print-area .sheet{width:8.5in;height:11in;box-sizing:border-box;padding:calc(var(--top) + var(--nudge-y)) 0 0 calc(var(--side) + var(--nudge-x));break-after:page;overflow:hidden}
   .print-area .sheet:last-child{break-after:auto}
   .print-area .label-grid{display:grid;max-width:none;grid-template-columns:repeat(var(--cols),var(--w));grid-auto-rows:var(--h);column-gap:var(--gap-x);row-gap:0}
-  .print-area .label-card{width:var(--w);height:var(--h);box-sizing:border-box;padding:var(--pad);gap:var(--pad);overflow:hidden;border:0!important;border-radius:0;background:#fff!important;color:#000}
-  /* QR code printed at 0.7" square */
-  .print-area .qr-holder{width:0.7in!important;height:0.7in!important;padding:0;border-radius:0}
+  .print-area .label-card{width:var(--w);height:var(--h);box-sizing:border-box;padding:var(--pad) var(--pad) var(--pad) var(--pad-left);gap:0.1in;overflow:hidden;border:0!important;border-radius:0;background:#fff!important;color:#000}
+  .print-area .qr-holder{width:var(--qr)!important;height:var(--qr)!important;padding:0;border-radius:0}
 
   /* text: small enough to fit beside the code; long names cut to 2 lines */
   .print-area .label-meta{min-width:0;flex:1 1 auto;gap:1px}
